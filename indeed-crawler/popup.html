@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        /* accent color is per-extension, everything else is shared */
+        :root{
+            --accent:#2557a7;
+            --bg:#ffffff;
+            --fg:#1b1b1f;
+            --muted:#6b7280;
+            --line:#e5e7eb;
+            --field:#ffffff;
+        }
+
+        @media (prefers-color-scheme: dark){
+            :root{
+                --bg:#1f2023;
+                --fg:#e8e8ea;
+                --muted:#9aa0a6;
+                --line:#3a3b3f;
+                --field:#2a2b2f;
+            }
+        }
+
+        *{box-sizing:border-box}
+
+        body{
+            width:300px;
+            margin:0;
+            padding:14px;
+            background:var(--bg);
+            color:var(--fg);
+            font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+        }
+
+        h1{
+            display:flex;
+            align-items:center;
+            gap:8px;
+            margin:0 0 14px;
+            font-size:13.5px;
+            font-weight:600;
+        }
+
+        h1::before{
+            content:"";
+            width:8px;
+            height:8px;
+            border-radius:50%;
+            background:var(--accent);
+            flex:none;
+        }
+
+        section{margin-bottom:14px}
+
+        .head{
+            display:flex;
+            justify-content:space-between;
+            align-items:baseline;
+            gap:8px;
+            margin-bottom:6px;
+        }
+
+        .head strong{font-size:12px;font-weight:600}
+
+        input[type=checkbox]{
+            width:14px;
+            height:14px;
+            margin:0;
+            flex:none;
+            accent-color:var(--accent);
+        }
+
+        .num{
+            display:flex;
+            align-items:center;
+            gap:6px;
+            font-size:12px;
+            color:var(--muted);
+        }
+
+        .num input{
+            width:76px;
+            padding:4px 6px;
+            border:1px solid var(--line);
+            border-radius:6px;
+            background:var(--field);
+            color:var(--fg);
+            font:inherit;
+        }
+
+        .num input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+
+        .hint{margin:6px 0 0;font-size:11px;color:var(--muted)}
+
+        #crawl{
+            width:100%;
+            padding:10px;
+            border:0;
+            border-radius:8px;
+            background:var(--accent);
+            color:#fff;
+            font:600 13px/1 inherit;
+            cursor:pointer;
+        }
+
+        #crawl:hover{filter:brightness(1.08)}
+        #crawl:disabled{opacity:.6;cursor:default}
+
+        #status{
+            margin-top:10px;
+            min-height:1.2em;
+            font-size:11.5px;
+            color:var(--muted);
+            word-break:break-word;
+        }
+
+        .checkline{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
+
+        .row{display:flex;gap:6px;margin-top:6px}
+
+        .row button{
+            flex:1;
+            padding:5px;
+            border:1px solid var(--line);
+            border-radius:6px;
+            background:var(--field);
+            color:var(--fg);
+            font:12px/1 inherit;
+            cursor:pointer;
+        }
+
+        .row button:hover{border-color:var(--accent)}
+        .row button:disabled{opacity:.5;cursor:default}
+
+        #proxyStatus{margin-top:6px;font-size:11px;color:var(--muted);word-break:break-word}
+    </style>
+</head>
+
+<body>
+
+<h1>Indeed &middot; sg / au / hk / uk / my / de</h1>
+
+<section>
+    <div class="head">
+        <strong>Pages</strong>
+        <label class="num">max pages <input type="number" id="maxPages" min="1" step="1" placeholder="all"></label>
+    </div>
+    <p class="hint">Blank = all pages. <strong>Sign in to Indeed in this browser first</strong> - without an
+    account it only serves page 1.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Company size</strong>
+        <label class="checkline"><input type="checkbox" id="employees"> look up</label>
+    </div>
+    <p class="hint">Off by default: it costs one extra page load per company and it is where Indeed
+    blocks hardest. Tick it only when you need the column - everything else is unaffected.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Speed</strong>
+        <label class="num">parallel <input type="number" id="concurrency" min="1" max="8" step="1" value="3"></label>
+    </div>
+    <p class="hint">Requests at the same time. The crawler slows itself down when Indeed pushes back,
+    so leave it at 3.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Exit IP (Webshare)</strong>
+        <label class="checkline"><input type="checkbox" id="useProxy"> rotate</label>
+    </div>
+    <p class="hint">Routes Indeed traffic through Webshare proxies and automatically switches IPs if blocked.</p>
+    <div class="row">
+        <button id="proxyTest">Check IPs</button>
+    </div>
+    <div id="proxyStatus"></div>
+</section>
+
+<button id="crawl">Crawl Search Results</button>
+
+<div id="status"></div>
+
+<!-- xlsx.full.min.js is not loaded here: it gets injected into the tab by popup.js -->
+<script src="popup.js"></script>
+
+</body>
+
+</html>

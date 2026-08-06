@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "SEEK / JobStreet / JobsDB Crawler",
+  "version": "1.1",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://au.seek.com/*",
+    "https://my.jobstreet.com/*",
+    "https://sg.jobstreet.com/*",
+    "https://hk.jobsdb.com/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SEEK / JobStreet / JobsDB Crawler",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

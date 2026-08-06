@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check content.js)",
+      "Bash(node *)"
+    ]
+  }
+}

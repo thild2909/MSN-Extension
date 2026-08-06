@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        /* accent color is per-extension, everything else is shared */
+        :root{
+            --accent:#1565c0;
+            --bg:#ffffff;
+            --fg:#1b1b1f;
+            --muted:#6b7280;
+            --line:#e5e7eb;
+            --field:#ffffff;
+        }
+
+        @media (prefers-color-scheme: dark){
+            :root{
+                --bg:#1f2023;
+                --fg:#e8e8ea;
+                --muted:#9aa0a6;
+                --line:#3a3b3f;
+                --field:#2a2b2f;
+            }
+        }
+
+        *{box-sizing:border-box}
+
+        body{
+            width:300px;
+            margin:0;
+            padding:14px;
+            background:var(--bg);
+            color:var(--fg);
+            font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+        }
+
+        h1{
+            display:flex;
+            align-items:center;
+            gap:8px;
+            margin:0 0 14px;
+            font-size:13.5px;
+            font-weight:600;
+        }
+
+        h1::before{
+            content:"";
+            width:8px;
+            height:8px;
+            border-radius:50%;
+            background:var(--accent);
+            flex:none;
+        }
+
+        section{margin-bottom:14px}
+
+        .head{
+            display:flex;
+            justify-content:space-between;
+            align-items:baseline;
+            gap:8px;
+            margin-bottom:6px;
+        }
+
+        .head strong{font-size:12px;font-weight:600}
+
+        .links a{
+            color:var(--accent);
+            font-size:11px;
+            cursor:pointer;
+            text-decoration:none;
+        }
+
+        .links a:hover{text-decoration:underline}
+        .links i{color:var(--muted);font-style:normal;margin:0 3px}
+
+        .options{
+            display:grid;
+            grid-template-columns:repeat(2,1fr);
+            gap:5px 10px;
+            padding:8px;
+            border:1px solid var(--line);
+            border-radius:8px;
+            background:var(--field);
+            max-height:190px;
+            overflow-y:auto;
+        }
+
+        .options label{
+            display:flex;
+            align-items:center;
+            gap:6px;
+            font-size:12px;
+            cursor:pointer;
+        }
+
+        input[type=checkbox]{
+            width:14px;
+            height:14px;
+            margin:0;
+            flex:none;
+            accent-color:var(--accent);
+        }
+
+        .num{
+            display:flex;
+            align-items:center;
+            gap:6px;
+            font-size:12px;
+            color:var(--muted);
+        }
+
+        .num input{
+            width:76px;
+            padding:4px 6px;
+            border:1px solid var(--line);
+            border-radius:6px;
+            background:var(--field);
+            color:var(--fg);
+            font:inherit;
+        }
+
+        .num input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+
+        .hint{margin:6px 0 0;font-size:11px;color:var(--muted)}
+
+        #crawl{
+            width:100%;
+            padding:10px;
+            border:0;
+            border-radius:8px;
+            background:var(--accent);
+            color:#fff;
+            font:600 13px/1 inherit;
+            cursor:pointer;
+        }
+
+        #crawl:hover{filter:brightness(1.08)}
+        #crawl:disabled{opacity:.6;cursor:default}
+
+        #status{
+            margin-top:10px;
+            min-height:1.2em;
+            font-size:11.5px;
+            color:var(--muted);
+            word-break:break-word;
+        }
+    
+        .options.cols-3{grid-template-columns:repeat(3,1fr)}
+
+        .checkline{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
+
+        /* which country site the active tab is on */
+        .site{
+            margin-left:auto;
+            font-size:11px;
+            font-weight:400;
+            color:var(--muted);
+            white-space:nowrap;
+            overflow:hidden;
+            text-overflow:ellipsis;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>Glassdoor <span id="site" class="site"></span></h1>
+
+<section>
+    <div class="head">
+        <strong>Load more</strong>
+        <label class="num">max clicks <input type="number" id="maxClicks" min="1" step="1" placeholder="all"></label>
+    </div>
+    <p class="hint">Glassdoor has no page URLs. The crawler clicks “Show more jobs” automatically. Leave blank to crawl all jobs, or set a limit to stop earlier.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Company size</strong>
+        <span class="links"><a id="all">all</a><i>·</i><a id="none">none</a></span>
+    </div>
+    <div class="options" id="sizes"><label><input type="checkbox" value="1-10">1-10</label><label><input type="checkbox" value="11-20">11-20</label><label><input type="checkbox" value="21-50">21-50</label><label><input type="checkbox" value="51-100">51-100</label><label><input type="checkbox" value="101-200">101-200</label><label><input type="checkbox" value="201-500">201-500</label><label><input type="checkbox" value="501-1000">501-1000</label><label><input type="checkbox" value="1001-2000">1001-2000</label><label><input type="checkbox" value="2001-5000">2001-5000</label><label><input type="checkbox" value="5001-10000">5001-10000</label><label><input type="checkbox" value="10001+">10001+</label></div>
+    <p class="hint" id="hint">No size filter: every company is exported.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Speed</strong>
+        <label class="num">parallel <input type="number" id="concurrency" min="1" max="12" step="1" value="6"></label>
+    </div>
+    <p class="hint">Requests running at the same time while reading company details.
+    Drop to 2-3 if you see 429 errors.</p>
+</section>
+
+<button id="crawl">Crawl Search Results</button>
+
+<div id="status"></div>
+
+<!-- xlsx.full.min.js is not loaded here: it gets injected into the tab by popup.js -->
+<script src="popup.js"></script>
+
+</body>
+
+</html>
