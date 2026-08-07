@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Glassdoor Company Crawler",
-  "version": "1.3",
+  "version": "1.6",
   "background": {
     "service_worker": "background.js"
   },
   "permissions": [
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "tabs"
   ],
   "host_permissions": [
     "https://*.glassdoor.com/*",

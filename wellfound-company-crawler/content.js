@@ -108,15 +108,30 @@
             if(status===403) forbidden.hit(url);
             else forbidden.ok();
 
-        }
+        },
+
+        // Two refusals in a row are answered by a real navigation, not by the rest of the ladder -
+        // but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available
     });
 
-    // once the breaker is open every further request is a guaranteed 403 plus a cooldown, so stop
-    // sending them and finish from what the list pages already gave us
-    const fetchDoc=(url,opts)=>fetcher.fetchDoc(url,Object.assign({
+    // Once the breaker is open every further FETCH is a guaranteed 403 plus a cooldown, so the
+    // guard stops sending them. It no longer ends the story though: a run of 403s is exactly the
+    // shape of a bot check, and a bot check is answered by a real navigation rather than by
+    // waiting. tabFirst takes over from here, and only the tab budget bounds it.
+    const cheap=(url,opts)=>fetcher.fetchDoc(url,Object.assign({
         guard:()=>forbidden.tripped,
         onOk:()=>forbidden.ok()
     },opts||{}));
+
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report:text=>report(text),
+        lastStatus:fetcher.lastStatus,
+        describe:url=>url.replace(/^https?:\/\/[^/]+\/company\//,"")
+    });
+
+    const fetchDoc=(url,opts)=>core.tabFirst({fetchDoc:cheap},tabs,url,opts);
 
     // kept outside the try: collectFrom/push are helpers at the end of the file and cannot see block-scoped declarations
     const unique=[];
@@ -326,7 +341,9 @@
         //     nothing at all to say they ever existed.
         //---------------------------------------------------
 
-        if(walk.missed.length&&!forbidden.tripped&&!gate.dead){
+        // the breaker and a written-off gate only close the cheap path; a tab can still get
+        // these, and a missed page is a whole page of companies
+        if(walk.missed.length&&((!forbidden.tripped&&!gate.dead)||tabs.available)){
 
             report(`Retrying ${walk.missed.length} page(s) that failed...`);
 
@@ -448,29 +465,29 @@
             let location="";
             let size=company.size;
 
+            // "label" | "near" | "" - see core.headcount. Carried into the summary so a run says
+            // how much of the Employees column is a published field and how much is inference.
+            let sizeSource=company.sizeSource||"";
+
             // jobs already read from the list page card -> no /jobs request needed
             let jobs=company.jobs||[];
             let pageJobs=[];
             let remoteFriendly=false;
 
-            // once the breaker has tripped every detail request is a guaranteed 403 plus a
-            // backoff sleep, so stop asking and use what the list page already gave us
-            const doc=forbidden.tripped?null:await fetchDoc(company.url);
+            // The breaker only stops the cheap path; fetchDoc still reopens the page in a tab, so
+            // a run of 403s no longer means the detail data is simply lost. A null here therefore
+            // means BOTH ways were refused, which is a real failure worth counting - unlike the
+            // old ~855 "failures" that were never sent in the first place.
+            const doc=await fetchDoc(company.url);
 
             if(!doc){
 
-                // only a real request can fail: once the breaker is open nothing was sent,
-                // so counting it as an error would report ~855 failures that never happened
-                if(!forbidden.tripped){
+                failed++;
 
-                    failed++;
-
-                    // marked so the retry pass can come back for it: a company refused at the
-                    // busiest moment of the run is usually readable once the queue has drained,
-                    // and a blank size cell is indistinguishable from "publishes no headcount"
-                    company.failedFetch=true;
-
-                }
+                // marked so the retry pass can come back for it: a company refused at the
+                // busiest moment of the run is usually readable once the queue has drained,
+                // and a blank size cell is indistinguishable from "publishes no headcount"
+                company.failedFetch=true;
 
             }
             else{
@@ -479,9 +496,24 @@
 
                 if(!size){
 
-                    const found=norm(doc.body).match(SIZE_DOC);
+                    // The <dl> field first, then a bounded scan. What is gone is
+                    // norm(doc.body).match(SIZE_DOC): a startup pitch reading "we are a team of
+                    // 40 employees" matched it and became the headcount, and once in the file
+                    // that number is indistinguishable from one Wellfound actually published -
+                    // including to the size filter, which then keeps or drops the company on it.
+                    size=extractField(doc,/^(company\s+)?size$/i,false);
 
-                    size=extractField(doc,/^(company\s+)?size$/i,false)||(found?found[0]:"");
+                    if(size){
+                        sizeSource="label";
+                    }
+                    else{
+
+                        const found=core.headcount(doc,{label:/^(company\s+)?size$/i,value:SIZE_DOC});
+
+                        size=found.text;
+                        sizeSource=found.source;
+
+                    }
 
                 }
 
@@ -530,10 +562,10 @@
             }
             else{
 
-                const jobsDoc=forbidden.tripped?null:await fetchDoc(company.url+"/jobs");
+                const jobsDoc=await fetchDoc(company.url+"/jobs");
 
                 if(jobsDoc) jobs=collectJobs(jobsDoc,index===0);
-                else if(!forbidden.tripped) failed++;
+                else failed++;
 
                 source="jobs-tab";
 
@@ -560,6 +592,8 @@
 
             if(modes.length===0&&remoteFriendly) modes.push("Remote");
 
+            company.employeesSource=sizeSource;
+
             rows[index]={
                 "Company Name":company.name,
                 "Location":location,
@@ -584,11 +618,16 @@
             // A company whose page was refused during the busiest stretch of the run gets one
             // more go once the queue has drained. The breaker being open means nothing was ever
             // sent, so there is nothing to retry in that case.
-            shouldRetry:company=>company.failedFetch===true&&!forbidden.tripped,
+            // retried while EITHER path can still get it: the breaker no longer means the end
+            shouldRetry:company=>company.failedFetch===true&&(!forbidden.tripped||tabs.available),
             onRetryPass:count=>report(`Retrying ${count} company page(s) that failed...`)
         });
 
         const results=rows.filter(Boolean);
+
+        // the companies that actually made it into the file, in the same order, so the summary
+        // can report where their Employees values came from
+        const exported=unique.filter((company,i)=>rows[i]);
 
         console.log(LOG,`skipped ${savedFetches} /jobs requests (positions already on the list page)`);
         console.log(LOG,"positions source:",sources);
@@ -611,6 +650,7 @@
 
         finish({
             results,
+            exported,
             totals,
             pagesPlanned:pages.length,
             crawled:crawledPages.size,
@@ -705,11 +745,13 @@
                 +(stats.skippedNoSize?` - WARNING: ${stats.skippedNoSize} of those had no size at all`:""),
             forbidden.total
                 ? `Blocked:   ${forbidden.total} request(s) got 403`
-                    +(forbidden.tripped?" - detail pages gave up, rows built from list data only":"")
+                    +(forbidden.tripped?" - the cheap path gave up, pages came from tabs or list data":"")
                 : `Blocked:   none`,
             `Filled:    ${withLocation} location, ${withPositions} positions, ${withTime} recruitment time`,
+            core.describeSizes(state.exported||[]),
             written.clipped?`Truncated: ${written.clipped} cell(s) hit Excel's 32,767 character limit`:"",
             fetcher.describe()?`Requests:  ${fetcher.describe()}`:"",
+            tabs.describe()?`${tabs.describe()}`:"",
             state.crashed?`\nThe run stopped early: ${state.crashed}.`
                 +`\nEverything collected before that point is in the file above.`:""
         ].filter(line=>line!=="").join("\n");
@@ -751,6 +793,7 @@
 
             finish({
                 results,
+                exported:unique,
                 totals:{results:0,pages:0},
                 pagesPlanned:0,
                 crawled:0,
@@ -824,7 +867,7 @@
 
             root.querySelectorAll('a[href^="/company/"]').forEach(a=>{
 
-                if(push(norm(a),a.getAttribute("href"),"",[])) added++;
+                if(push(norm(a),a.getAttribute("href"),null,[])) added++;
 
             });
 
@@ -865,7 +908,14 @@
         }
 
         visited.add(url);
-        unique.push({name,url,size:size||"",jobs:list});
+
+        unique.push({
+            name,
+            url,
+            size:size&&size.text||"",
+            sizeSource:size&&size.source||"",
+            jobs:list
+        });
 
         return true;
 
@@ -1275,6 +1325,9 @@
     // <span class="text-xs italic text-neutral-500">501-1000<!-- --> Employees</span>
     //---------------------------------------------------
 
+    // Returns {text,source}. SIZE_EXACT is an element whose ENTIRE text is the value, which is as
+    // good as a labelled field; SIZE_LOOSE only found the string somewhere inside the card, so it
+    // is recorded as the weaker reading rather than passed off as the same thing.
     function findSizeNear(card){
 
         let node=card;
@@ -1289,19 +1342,19 @@
 
                 const text=norm(el);
 
-                if(SIZE_EXACT.test(text)) return text;
+                if(SIZE_EXACT.test(text)) return {text,source:"label"};
 
             }
 
             const loose=norm(node).match(SIZE_LOOSE);
 
-            if(loose) return loose[0];
+            if(loose) return {text:loose[0],source:"near"};
 
             node=node.parentElement;
 
         }
 
-        return "";
+        return {text:"",source:""};
 
     }
 

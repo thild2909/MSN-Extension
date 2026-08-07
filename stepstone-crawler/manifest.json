@@ -1,11 +1,15 @@
 {
   "manifest_version": 3,
   "name": "StepStone Company Crawler",
-  "version": "1.1",
+  "version": "1.2",
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": [
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "tabs"
   ],
   "host_permissions": [
     "https://www.stepstone.de/*"

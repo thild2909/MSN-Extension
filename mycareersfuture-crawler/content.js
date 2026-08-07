@@ -32,19 +32,36 @@
     // moment anything is actually refused, which is the only time the wait buys anything.
     const gate=core.makeGate({minGap:0,limit:6,log:LOG});
 
-    const fetcher=core.makeFetcher(gate,{log:LOG});
-
-    const fetchDoc=fetcher.fetchDoc;
+    const fetcher=core.makeFetcher(gate,{
+        log:LOG,
+        // Two refusals in a row are answered by a real navigation, not by the rest of the
+        // ladder - but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available
+    });
 
     // MCF does not expose pageSize in the DOM; the site default is 20
     const DEFAULT_PAGE_SIZE=20;
+
+    // How long a page turn in the live tab gets, and how often it is looked at. The poll interval
+    // is itself part of the runtime - every check costs half its interval on average - so it is
+    // small enough to be free. The ceiling is unchanged: 6 seconds was 24 steps of 250ms.
+    const PAGE_TIMEOUT=6000;
+    const PAGE_POLL=40;
 
     // "Posted 4 days ago" / "Posted today" / "Posted 04 Aug 2026"
     const UNIT={minute:1,hour:60,day:1440,week:10080,month:43200,year:525600};
 
     // company profile: "50 - 100 employees" or "Company size: 50-100"
-    const SIZE_DOC=/([\d,]+\s*(?:[-–—]|to)\s*[\d,]+|[\d,]+\s*\+|[\d,]+)\s*employees/i;
-    const SIZE_LABEL=/company\s+size\s*[:\-]?\s*([\d,]+\s*(?:[-–—]|to)\s*[\d,]+|[\d,]+\s*\+|[\d,]+)/i;
+    //
+    // Either the "Company size" prefix or the "employees" suffix is REQUIRED. A bare number is
+    // never a headcount, and this regex used to be run over the whole page body, where "50" from
+    // a salary, a postcode or a benefits list matched just as happily.
+    const RANGE="[\\d,]+\\s*(?:[-–—]|to)\\s*[\\d,]+|[\\d,]+\\s*\\+|[\\d,]+";
+
+    const SIZE_VALUE=new RegExp(`company\\s+size\\s*[:\\-]?\\s*(?:${RANGE})|(?:${RANGE})\\s*employees`,"i");
+
+    // anchored: the whole text block is the label, and the value sits in the next one
+    const SIZE_LABEL=/^company\s+size$/i;
 
     const startedAt=performance.now();
 
@@ -54,6 +71,18 @@
     let paging=null;
 
     const report=core.makeReporter("mcf-crawler-status",LOG);
+
+    // A 429/403/5xx is often "that did not look like a browser" rather than "too fast", and no
+    // amount of backing off answers it. Reopening the URL as a real navigation does, and if the
+    // check needs a person the tab is put in front of them - once, for the whole site.
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report,
+        lastStatus:fetcher.lastStatus,
+        describe:url=>"page "+((core.paramOf(url,"page",ORIGIN)||0)+1)
+    });
+
+    const fetchDoc=(url,opts)=>core.tabFirst(fetcher,tabs,url,opts);
 
     const norm=core.norm;
     const blocks=core.blocks;
@@ -314,7 +343,6 @@
 
         let failed=0;
         let processed=0;
-        let withSize=0;
         let dateFixed=0;
 
         await core.mapPool(companies,concurrency,async(company,index)=>{
@@ -355,10 +383,15 @@
 
                     if(page){
 
-                        const text=blocks(page.body).join(" ");
-                        const found=text.match(SIZE_LABEL)||text.match(SIZE_DOC);
+                        // bounded to a labelled field or a small element that IS the value -
+                        // joining the whole body and running the regex over it turned any number
+                        // followed by "employees" anywhere on the page into a headcount
+                        const size=core.headcount(page,{label:SIZE_LABEL,value:SIZE_VALUE});
 
-                        if(found) company.employees=found[0].replace(/\s+/g," ").trim();
+                        if(size.text){
+                            company.employees=size.text;
+                            company.employeesSource=size.source;
+                        }
                         else if(index<3) console.warn(LOG,"no employee count on the company page of",company.name);
 
                     }
@@ -373,8 +406,6 @@
                 }
 
             }
-
-            if(company.employees) withSize++;
 
             if(!company.counted){
                 company.counted=true;
@@ -392,6 +423,10 @@
         //---------------------------------------------------
         // 6. export to excel + trigger the download
         //---------------------------------------------------
+
+        // counted off the data at the end rather than inside the worker, which the retry pass
+        // runs a second time for every company that failed the first
+        const withSize=companies.filter(company=>company.employees).length;
 
         finish({companies,kept,skipped,withSize,dateFixed,failed,crashed:null});
 
@@ -472,8 +507,10 @@
             +`${state.failed} request errors.`
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
             +coverage
+            +(core.describeSizes(state.companies)?`\n${core.describeSizes(state.companies)}`:"")
             +(problems.length?"\n\n"+problems.join("\n"):"")
             +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")
+            +(tabs.describe()?`\n${tabs.describe()}`:"")
             +(state.crashed?`\n\nThe run stopped early: ${state.crashed}.`
                 +"\nEverything collected before that point is in the file above.":"");
 
@@ -617,14 +654,23 @@
 
         button.click();
 
-        // React re-renders the list -> wait for the first card to change
-        for(let i=0;i<24;i++){
+        // React re-renders the list -> wait for the first card to change.
+        //
+        // The check comes BEFORE the sleep, and the sleep is short. It used to be the other way
+        // round with a 250ms step, so a re-render that finished in 20ms was still charged the full
+        // quarter second - on a 48 page search that is twelve seconds of watching a list that had
+        // already changed. Waiting is only ever worth what it takes to notice.
+        const deadline=performance.now()+PAGE_TIMEOUT;
 
-            await core.sleep(250);
+        for(;;){
 
             const now=firstJobHref();
 
             if(now&&now!==before) return true;
+
+            if(performance.now()>deadline) break;
+
+            await core.sleep(PAGE_POLL);
 
         }
 
@@ -852,7 +898,12 @@
         for(const job of list){
 
             const name=job["Company"]||"(unknown)";
-            const key=name.toLowerCase();
+
+            // Grouping on the lowercased name split "ACME PTE. LTD." and "ACME PTE LTD" into two
+            // rows, each holding a slice of the positions - and on a Singapore board almost every
+            // employer carries that suffix. core.nameKey folds case, punctuation and a closed list
+            // of legal forms and nothing else, so distinct employers still stay apart.
+            const key=core.nameKey(name);
 
             let company=byName.get(key);
 
@@ -866,7 +917,9 @@
                     posted:"",
                     postedAge:Infinity,
                     jobUrl:job["Job URL"],
-                    employees:""
+                    employees:"",
+                    // "label" | "near" | "" - see core.headcount
+                    employeesSource:""
                 };
 
                 byName.set(key,company);

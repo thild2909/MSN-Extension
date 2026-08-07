@@ -118,24 +118,6 @@
         }
 
         .checkline{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
-
-        .row{display:flex;gap:6px;margin-top:6px}
-
-        .row button{
-            flex:1;
-            padding:5px;
-            border:1px solid var(--line);
-            border-radius:6px;
-            background:var(--field);
-            color:var(--fg);
-            font:12px/1 inherit;
-            cursor:pointer;
-        }
-
-        .row button:hover{border-color:var(--accent)}
-        .row button:disabled{opacity:.5;cursor:default}
-
-        #proxyStatus{margin-top:6px;font-size:11px;color:var(--muted);word-break:break-word}
     </style>
 </head>
 
@@ -168,18 +150,6 @@
     </div>
     <p class="hint">Requests at the same time. The crawler slows itself down when Indeed pushes back,
     so leave it at 3.</p>
-</section>
-
-<section>
-    <div class="head">
-        <strong>Exit IP (Webshare)</strong>
-        <label class="checkline"><input type="checkbox" id="useProxy"> rotate</label>
-    </div>
-    <p class="hint">Routes Indeed traffic through Webshare proxies and automatically switches IPs if blocked.</p>
-    <div class="row">
-        <button id="proxyTest">Check IPs</button>
-    </div>
-    <div id="proxyStatus"></div>
 </section>
 
 <button id="crawl">Crawl Search Results</button>

@@ -58,22 +58,31 @@
     const CARD="div.cardOutline";
     const CARD_FALLBACK="div.job_seen_beacon";
 
-    // Extra floor between two requests, per request kind, ON TOP of the adaptive gap below.
-    // Zero on purpose: a fixed toll is paid on every request whether or not Indeed minds, and at
-    // 900ms across 62 pages that was a minute of waiting for nothing. The gap is the real control
-    // and it already widens the moment anything is refused - so run at full speed and let being
-    // rate limited, not the fear of it, be what slows the crawler down.
-    const DELAY=0;
-    const DETAIL_DELAY=0;
-
     // Indeed rate limits per IP, so pacing one worker at a time is useless: the gate has to
     // sit in front of EVERY request. It does three things at once -
     //   1. at most `limit` requests in flight, and the limit shrinks while we are being blocked
     //   2. never two request STARTS closer together than `gap` (+ jitter, so the workers
     //      that were blocked together do not come back in lockstep)
     //   3. a 429/403/503 parks every worker until `pausedUntil`, not just the one that got it
-    // the floor the gap returns to once nothing is being refused - i.e. how fast a clean run goes
-    const MIN_GAP=120;
+    //
+    // There is deliberately NO fixed per-request toll on top of this. A flat delay is paid on
+    // every request whether or not Indeed minds, and at 900ms across 62 pages that was a minute
+    // of waiting for nothing. The gap is the real control and it widens the moment anything is
+    // refused - so run at full speed and let being rate limited, not the fear of it, slow us down.
+    //
+    // The floor the gap returns to once nothing is being refused - i.e. how fast a clean run goes.
+    //
+    // Zero, like every other crawler in this family, because the paragraph above was not true of
+    // this file: 120ms WAS a fixed per-request toll, and it did not merely slow requests down, it
+    // silently capped how many could be in flight. The gate spaces request STARTS by the gap, so
+    // the most that can overlap is one page's load time divided by it - measured on 40 company
+    // pages of 400ms each, "parallel 8" ran three at a time and finished in 8.5s, exactly as
+    // "parallel 3" did. Everything above 3 in the popup was decoration.
+    //
+    // Nothing is given up by removing it. The first refusal still jumps the gap straight to
+    // max(250, gap) * 1.7, the pool still narrows, and there is now a tab fallback behind both.
+    // Being rate limited is what slows this crawler down, not the fear of it.
+    const MIN_GAP=0;
     const MAX_GAP=8000;
     const MAX_COOLDOWN=30000;
     const MAX_ATTEMPTS=6;
@@ -89,389 +98,16 @@
     // how many pages may be abandoned to blocks in a row before we stop asking for company size
     const BLOCK_LIMIT=3;
 
-    // what a block costs once the exit IP has been swapped: just enough for the network stack to
-    // finish picking up the new route, instead of the exponential cooldown a same-IP block earns
-    const ROTATE_SETTLE=1200;
-
-    // how long every worker is parked while the swap is in flight (apply + the IP echo check)
-    const ROTATE_HOLD=6000;
-
-    // the worker clears the browser proxy after 20 quiet minutes; a long run has to say it is alive
-    const PING_EVERY=60000;
-
-    const throttle={
-
-        deadEnds:0,
-        dead:false,
-        paidOut:0,
-
-        // how much cooling off is worth sitting through before the session is written off. Raised
-        // while paginating, where quitting early throws away every page still to come.
-        budget:BLOCK_BUDGET,
-
-        gap:MIN_GAP,
-        pausedUntil:0,
-        nextSlot:0,
-        chain:Promise.resolve(),
-
-        limit:1,
-        maxLimit:1,
-        active:0,
-        waiting:[],
-
-        clean:0,
-        blocks:0,
-
-        // called before the request goes out; must be paired with leave()
-        async enter(pace){
-
-            for(;;){
-
-                if(this.active<this.limit){
-                    this.active++;
-                    break;
-                }
-
-                await new Promise(resolve=>this.waiting.push(resolve));
-
-            }
-
-            // one shared queue so the start times interleave instead of bunching up
-            const mine=this.chain.then(async()=>{
-
-                for(;;){
-
-                    const now=performance.now();
-                    const wait=Math.max(this.pausedUntil-now,this.nextSlot-now);
-
-                    if(wait<=0) break;
-
-                    await sleep(wait+Math.random()*200);
-
-                }
-
-                this.nextSlot=performance.now()+Math.max(pace||0,this.gap);
-
-            });
-
-            this.chain=mine.catch(()=>{});
-
-            return mine;
-
-        },
-
-        leave(){
-
-            this.active--;
-
-            const next=this.waiting.shift();
-
-            if(next) next();
-
-        },
-
-        holdUntil:0,
-
-        // park every worker without counting it as a penalty. Used while the exit IP is being
-        // swapped: a request that leaves mid-swap goes out on the IP we are running away from,
-        // gets blocked again, and buys nothing.
-        hold(ms){
-
-            const until=performance.now()+ms;
-
-            this.holdUntil=Math.max(this.holdUntil,until);
-            this.pausedUntil=Math.max(this.pausedUntil,until);
-
-        },
-
-        // the swap finished early - hand back the part of the hold nobody needed. A cooldown that
-        // outlives the hold was set by a real penalty and is left alone.
-        release(ms){
-
-            if(this.pausedUntil>this.holdUntil) return;
-
-            this.holdUntil=0;
-            this.pausedUntil=performance.now()+(ms||0);
-
-        },
-
-        // `rotated` is true when the request went out on an IP that has since been replaced.
-        // Indeed rate limits per IP, so on a fresh IP the block simply does not apply any more:
-        // sitting out the full exponential cooldown would be waiting for nothing. Only the short
-        // settle time the network stack needs to pick up the new route is worth paying.
-        // `widen` says this is a NEW request being refused rather than another go at one already
-        // refused. Only the first tells us anything about pace: the gap grows 1.7x per block, so
-        // letting all six retries of one unhappy page widen it multiplies the pace by 24 and every
-        // page after it crawls at the 8s ceiling. Retries still cool down - that is the lever for
-        // waiting a rate limit out - they just stop rewriting the speed of the whole run.
-        penalize(retryMs,rotated,widen){
-
-            this.blocks++;
-            this.clean=0;
-
-            if(rotated){
-
-                this.release(ROTATE_SETTLE+Math.random()*200);
-
-                // the pace was never the problem on the new IP, and the block budget must not run
-                // down on cooldowns we did not actually serve
-                this.blocks=Math.max(0,this.blocks-1);
-
-                report(`rate limited - switched exit IP (${proxy.label||"new IP"})`);
-
-                return;
-
-            }
-
-            if(widen) this.gap=Math.min(MAX_GAP,this.gap*1.7);
-
-            // 1.5s, 3s, 6s, 12s, 24s, 48s... capped, and always at least what Retry-After asked for
-            const cool=Math.min(MAX_COOLDOWN,
-                Math.max(retryMs||0,1500*Math.pow(2,Math.min(5,this.blocks-1))));
-
-            this.pausedUntil=Math.max(this.pausedUntil,performance.now()+cool+Math.random()*400);
-
-            // being blocked means we are running too wide as well as too fast
-            if(this.limit>1) this.limit--;
-
-            // every cooldown since the last page that actually came back
-            this.paidOut+=cool;
-
-            if(this.paidOut>=this.budget){
-
-                this.dead=true;
-
-                report("Indeed has blocked this session - stopping the company size lookup");
-
-                return;
-
-            }
-
-            report(`rate limited - pausing ${Math.round(cool/1000)}s`
-                +` (gap ${Math.round(this.gap)}ms, ${this.limit} parallel)`);
-
-        },
-
-        relax(){
-
-            this.clean++;
-            this.deadEnds=0;
-            this.paidOut=0;
-
-            // A clean run walks the penalty back down. It used to shed 20% every ten pages, which
-            // from a 2.4s gap needs ~100 clean requests to get back to normal - so one bad moment
-            // at page 48 taxed every page after it. The penalty should last as long as Indeed is
-            // actually pushing back, not for the rest of the run.
-            if(this.clean%3===0&&this.blocks>0) this.blocks--;
-
-            if(this.clean%3!==0) return;
-
-            this.gap=Math.max(MIN_GAP,this.gap*0.65);
-
-            if(this.limit<this.maxLimit){
-
-                this.limit++;
-
-                const next=this.waiting.shift();
-
-                if(next) next();
-
-            }
-
-        }
-
-    };
-
-    //---------------------------------------------------
-    // Webshare proxy, driven from background.js
-    //
-    // The IP is what Indeed rate limits, so changing it is the only move that actually clears a
-    // block - every other knob here (gap, parallelism, cooldown) just slows down how fast we walk
-    // into the next one. A content script cannot change its own route, so background.js does it.
-    //---------------------------------------------------
-
-    const proxy={
-
-        enabled:false,
-        used:false,
-        label:"",
-        pool:0,
-
-        // which IP the crawler is currently sending on. A request carries the seat it left under,
-        // so a 429 that arrives after the IP already changed is recognised as stale.
-        seat:"",
-        rotations:0,
-        exhausted:false,
-
-        since:0,
-        every:0,
-        lastPing:0,
-
-        // every worker that was blocked by the same IP shares this one promise
-        rotating:null,
-
-        async send(message){
-
-            try{
-
-                const reply=await chrome.runtime.sendMessage(message);
-
-                return reply||{ok:false,error:"no reply from the extension worker"};
-
-            }
-            catch(e){
-
-                return {ok:false,error:e&&e.message||String(e)};
-
-            }
-
-        },
-
-        async start(country,every){
-
-            const reply=await this.send({type:"proxy:enable",country});
-
-            if(!reply.ok) return reply;
-
-            this.enabled=true;
-            this.used=true;
-            this.every=every>0?every:0;
-            this.label=reply.label||"";
-            this.seat=reply.seat||"";
-            this.pool=reply.pool||0;
-            this.lastPing=performance.now();
-
-            return reply;
-
-        },
-
-        // Indeed's edge refuses some datacentre IPs outright with a Cloudflare interstitial. That
-        // is not a rate limit and no wait clears it, so the address is retired and we move on. If
-        // the whole pool turns out to be refused, the run is finished on the real IP - a slow
-        // crawl beats a crawl where every request comes back as a captcha page.
-        async giveUp(reason){
-
-            await this.stop();
-
-            this.exhausted=true;
-            this.label="direct connection";
-
-            report("Proxy off: "+reason+" - continuing on the normal connection");
-
-            console.warn(LOG,"proxy given up:",reason);
-
-        },
-
-        // `seat` is the IP the blocked request actually left under. Several workers are always in
-        // flight together, so their 429s arrive in a burst - but they were all earned on the same
-        // address, and one rotation answers all of them. Quoting the seat back is what tells a
-        // block on the IP we are still using apart from one on an IP we have already left; a
-        // wall-clock window cannot, and would either burn the whole pool on one bad minute or
-        // swallow the verdict on the IP that replaced it.
-        async rotate(reason,seat){
-
-            if(!this.enabled||this.exhausted) return false;
-
-            // the route already moved on after that request left: nothing more to do for it
-            if(seat&&this.seat&&seat!==this.seat) return true;
-
-            // and the ones that left under the seat still in use share a single rotation
-            if(this.rotating) return this.rotating;
-
-            this.rotating=(async()=>{
-
-                const reply=await this.send({type:"proxy:rotate",reason:String(reason||"block")});
-
-                if(!reply.ok){
-
-                    // every address refused: the proxy is not a slower route any more, it is a
-                    // wall, and the real IP is the only one left that answers
-                    if(reply.walled){
-                        await this.giveUp(reply.error);
-                        return false;
-                    }
-
-                    // one usable IP left, or the worker is gone - keep it and fall back to the
-                    // plain backoff instead of asking for a swap that cannot happen
-                    this.exhausted=true;
-
-                    report("proxy cannot rotate ("+(reply.error||"unknown")+") - backing off instead");
-
-                    return false;
-
-                }
-
-                this.since=0;
-                this.lastPing=performance.now();
-                this.seat=reply.seat||"";
-
-                if(reply.label) this.label=reply.label;
-                if(reply.rotations) this.rotations=reply.rotations;
-
-                return true;
-
-            })();
-
-            try{
-                return await this.rotating;
-            }
-            finally{
-                this.rotating=null;
-            }
-
-        },
-
-        // called after every page that came back: swaps the IP before Indeed gets a chance to
-        // count far enough to block it, and keeps the worker's auto-off timer from firing
-        async onSuccess(){
-
-            if(!this.enabled) return;
-
-            if(this.every&&++this.since>=this.every){
-
-                // same reason as a block driven swap: nothing may leave while the route changes
-                throttle.hold(ROTATE_HOLD);
-
-                try{
-                    await this.rotate("scheduled");
-                }
-                finally{
-                    throttle.release(0);
-                }
-
-                return;
-
-            }
-
-            if(performance.now()-this.lastPing<PING_EVERY) return;
-
-            this.lastPing=performance.now();
-
-            await this.send({type:"proxy:ping"});
-
-        },
-
-        async stop(){
-
-            if(!this.enabled) return;
-
-            this.enabled=false;
-
-            await this.send({type:"proxy:disable"});
-
-        }
-
-    };
-
     //---------------------------------------------------
     // the sign-in wall
     //
     // Indeed serves page 1 of a search to anyone and answers every later page with a redirect to
     // secure.indeed.com carrying "branding=page-two-signin" - or, when the request looks like a
     // fetch rather than a click, with Cloudflare's 403 in front of it. Measured on sg, au, hk, uk
-    // and de: page 1 is 200 and page 2 is the wall, on the home connection and on every proxy
-    // alike. It is an account requirement, not a rate limit, so pacing, cooling off and swapping
-    // exit IPs are all answers to a question nobody asked.
+    // and de: page 1 is 200 and page 2 is the wall, from home and from ten datacentre exit IPs
+    // alike. It is an account requirement, not a rate limit, so pacing, cooling off and changing
+    // where the request comes from are all answers to a question nobody asked - the only thing
+    // that clears it is being signed in to Indeed in this browser.
     //---------------------------------------------------
 
     const SIGNIN_HOST=/(^|\.)secure\.indeed\.com$/i;
@@ -482,9 +118,19 @@
     const wall={hit:false,cleared:false,reason:""};
 
     function pagedUrl(url){
+        return core.paramOf(url,"start",ORIGIN)>0;
+    }
+
+    function isSignIn(url){
+
+        if(!url) return false;
 
         try{
-            return +new URL(url,ORIGIN).searchParams.get("start")>0;
+
+            const parsed=new URL(url,ORIGIN);
+
+            return SIGNIN_HOST.test(parsed.hostname)||SIGNIN_PATH.test(parsed.pathname+parsed.search);
+
         }
         catch(e){
             return false;
@@ -494,20 +140,7 @@
 
     // fetch follows the redirect, so the answer carries the address it ended up at
     function signInWall(response){
-
-        if(!response||!response.url) return false;
-
-        try{
-
-            const url=new URL(response.url,ORIGIN);
-
-            return SIGNIN_HOST.test(url.hostname)||SIGNIN_PATH.test(url.pathname+url.search);
-
-        }
-        catch(e){
-            return false;
-        }
-
+        return !!response&&isSignIn(response.url);
     }
 
     function hitWall(url,reason){
@@ -522,9 +155,6 @@
         report("Indeed only serves page 1 without an account - stopping pagination");
 
     }
-
-    // two companies can share one /cmp/ page ("Capgemini" and "Capgemini Sogeti") -> fetch it once
-    const docCache=new Map();
 
     // Posting date, per root domain language:
     //   sg/au/uk/my "Posted 3 days ago", "Employer Active 30+ days ago", "Just posted"
@@ -558,17 +188,58 @@
     // company page: a "Size" label + the value "51 to 200", or "51 to 200 employees"
     // de uses a dot as the thousands separator ("10.000"), so the number part must accept "." and ","
     const SIZE_LABEL=/^(?:size|company size|employees|number of employees|公司規模|公司规模|規模|规模|員工人數|员工人数|größe|grösse|unternehmensgröße|unternehmensgrösse|mitarbeiter|mitarbeiterzahl)$/i;
-    const SIZE_DOC=/(more than \d[\d.,]*|over \d[\d.,]*|mehr als \d[\d.,]*|\d[\d.,]*\s*(?:to|bis|–|—|-)\s*\d[\d.,]*|\d[\d.,]*\+)\s*(?:employees?|mitarbeiter\w*|名員工|名员工)?/i;
+
+    // The unit word is REQUIRED here, unlike the label path. "51 to 200" on its own is only a
+    // headcount because a "Size" label next to it says so; standing alone in an element it is
+    // indistinguishable from a salary band ("3,000 - 5,000"), and this regex used to be run over
+    // the whole page body, where it found exactly that.
+    const SIZE_UNIT="(?:employees?|mitarbeiter\\w*|besch[äa]ftigte\\w*|名員工|名员工|員工人數|员工人数)";
+
+    const SIZE_VALUE=new RegExp(
+        "(?:(?:more than|over|mehr als)\\s*\\d[\\d.,]*"
+        +"|\\d[\\d.,]*\\s*(?:to|bis|–|—|-)\\s*\\d[\\d.,]*"
+        +"|\\d[\\d.,]*\\+)\\s*"+SIZE_UNIT,"i");
 
     // work-model chips on the card, separated from benefit chips (Health insurance, Stock options...)
-    const MODE_CHIP=/remote|work from home|hybrid|遙距|遥距|遠端|远程|在家工作|混合|homeoffice|home-office|telearbeit/i;
+    // The work model, in one place. readMode() and the chip filter used to carry their own copies
+    // of this list, which is how "telearbeit" ended up in one of them and not the other.
+    const HYBRID=/hybrid|混合/i;
+    const REMOTE=/remote|work from home|遙距|遥距|遠端|远程|在家工作|homeoffice|home-office|telearbeit/i;
+
+    // work-model chips on the card, separated from benefit chips (Health insurance, Stock options...)
+    const MODE_CHIP=new RegExp(REMOTE.source+"|"+HYBRID.source,"i");
 
     const jobs=[];
     const visited=new Set();
 
-    // connections that died before Indeed answered anything - kept apart from Indeed's own
-    // refusals, because the two call for opposite reactions and have different remedies
-    let netErrors=0;
+    // Both fillPosted and collectFromJson want the page's embedded card JSON, and each call
+    // re-scans every <script> and JSON.parses the better part of a megabyte. Once per document is
+    // enough. Declared up here rather than next to jobCardsJson because page 1 is collected before
+    // the bottom of this file is reached, and a `const` down there would still be in its temporal
+    // dead zone by then.
+    const cardsJson=new WeakMap();
+
+    const CARDS_KEY='"mosaic-provider-jobcards"';
+
+    // How far past the name the value may start. The two shapes Indeed ships are
+    //   window.mosaic.providerData["mosaic-provider-jobcards"]={...}
+    //   ..."mosaic-provider-jobcards":{...}
+    // so the separator is a few characters away at most. Anything further along is a different
+    // statement that merely mentions the name.
+    const CARDS_LEAD=/^[\s\])]*[=:]\s*$/;
+    const CARDS_LEAD_MAX=40;
+
+    // the marker was on the page but nothing under it parsed - said once, because it means the
+    // Recruitment time column will be empty and the reason is not visible anywhere else.
+    //
+    // These four live up here, not next to readCardsJson at the bottom of the file, for the same
+    // reason cardsJson does: page 1 is collected from the `try` block above, long before the
+    // bottom of this file is reached, and a `const` down there is still in its temporal dead zone.
+    let cardsJsonWarned=false;
+
+    // 403s Cloudflare labels as its own challenge, rather than Indeed refusing the request on its
+    // merits. Backing off is the same either way, but it changes what the user should do about it.
+    let challenges=0;
 
     const startedAt=performance.now();
 
@@ -582,29 +253,222 @@
 
     let resumed=0;
 
-    function sleep(ms){
-        return new Promise(r=>setTimeout(r,ms));
+    const report=core.makeReporter("indeed-crawler-status",LOG);
+
+    const norm=core.norm;
+    const pick=core.pick;
+    const blocks=core.blocks;
+
+    //---------------------------------------------------
+    // the engine
+    //
+    // This was a private copy of core.js's gate and fetcher, and it had drifted. Two things it had
+    // stopped doing, both of which cost whole pages:
+    //   * anything other than 429/503/403 was written off on the first answer, so a 502 - which is
+    //     what Cloudflare returns when Indeed's origin has a moment - lost the page AND the link to
+    //     every page behind it, three of those in a row ending the walk;
+    //   * a body that stopped arriving mid-read threw straight out of loadPages, so a truncated
+    //     response at page 30 of 60 ended the run instead of costing one retry.
+    // Core handles both, plus the log throttling and the per-reason request stats the summary
+    // prints, and a fix there now reaches this crawler like it reaches the other six.
+    //
+    // Indeed keeps two rules of its own, because neither belongs in a shared engine: the sign-in
+    // wall, and "a paginated page is worth the full attempt ladder even while everything else is
+    // being cut short".
+    //---------------------------------------------------
+
+    const gate=core.makeGate({
+        minGap:MIN_GAP,
+        maxGap:MAX_GAP,
+        maxCooldown:MAX_COOLDOWN,
+        limit:3,
+        budget:BLOCK_BUDGET,
+        log:LOG
+    });
+
+    const fetcher=core.makeFetcher(gate,{
+        log:LOG,
+        maxAttempts:MAX_ATTEMPTS,
+        maxTransport:MAX_TRANSPORT_TRIES,
+        transportPause:TRANSPORT_PAUSE,
+        // Indeed answers 403 when it suspects a bot, and that one is worth another go
+        retryForbidden:true,
+
+        // Two refusals in a row are answered by a real navigation, not by the rest of the ladder -
+        // but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available,
+
+        onRefused:(status,url,attempt,response)=>{
+
+            // Cloudflare labels its own 403s. It is refusing the browser before Indeed ever looks
+            // at the request, so it calls for a captcha solved by hand rather than a longer wait -
+            // worth telling apart in the summary even though the backoff is the same. A paged URL
+            // is excluded: those are refused to everyone, so a challenge on one says nothing
+            // about this browser.
+            if(status===403&&!pagedUrl(url)&&response.header("cf-mitigated")==="challenge"){
+
+                challenges++;
+
+                if(challenges<=3) console.warn(LOG,"Cloudflare challenge on",url);
+
+            }
+
+            report(gate.dead
+                ?"Indeed has blocked this session - stopping"
+                :`rate limited (gap ${Math.round(gate.gap)}ms, ${gate.limit} parallel)`);
+
+        }
+    });
+
+    // what Indeed needs on top of the shared fetcher, worked out per request
+    function settings(url,tries){
+
+        return {
+
+            // once Indeed has said the rest of the list needs an account, every further page
+            // request gets the same answer
+            guard:target=>wall.hit&&pagedUrl(target),
+
+            // While things are degrading every URL gets two tries instead of six, so we find out
+            // fast - except a paginated page, which is worth the full ladder even then: it carries
+            // fifteen jobs and, until it comes back, no way of knowing where the next one starts.
+            tries:tries||(gate.blocks>=3&&!pagedUrl(url)?2:MAX_ATTEMPTS),
+
+            inspect:(response,target,attempt)=>{
+
+                // fetch follows the redirect, so the answer carries the address it ended up at
+                if(signInWall(response)){
+
+                    hitWall(target,"redirected to the Indeed sign-in page");
+
+                    return "stop";
+
+                }
+
+                // Handing a twice-refused page to a tab instead of finishing the ladder used to be
+                // done here, with Indeed's own copy of the status list. It is core.makeFetcher's
+                // `canEscalate` now, so every crawler does it the same way and there is one list.
+
+                return "";
+
+            },
+
+            // a paginated page that came back is proof this session may read past page 1
+            onOk:()=>{
+
+                if(pagedUrl(url)) wall.cleared=true;
+
+            }
+
+        };
+
     }
 
-    // send status back to the popup (it may already be closed -> swallow the error)
-    function report(text){
+    //---------------------------------------------------
+    // the tab fallback
+    //
+    // The machinery is core.makeTabFallback - the same one every other crawler uses. Only the two
+    // things that are Indeed's own live here: a tab sent to the sign-in page is the account wall
+    // rather than a bot check, and a paged URL that a tab DID get is proof this session may read
+    // past page 1.
+    //
+    // `askLimit:0` - this crawler never takes the window away from whoever is using the machine.
+    // core.makeTabFallback otherwise brings a tab forward and waits for a person when a challenge
+    // will not clear itself, which is right for a short run someone is watching; an Indeed run is
+    // 80 tabs deep and unattended. The cost of that choice is real and is not hidden: a challenge
+    // that does not clear on its own loses that page, and the summary says how many.
+    //---------------------------------------------------
 
-        console.log(LOG,text);
+    const tabs=core.makeTabFallback({
+
+        log:LOG,
+        report,
+        askLimit:0,
+        lastStatus:fetcher.lastStatus,
+        describe:url=>describeUrl(url),
+
+        // an account is needed for this one, and a tab is signed in to the same account
+        worthIt:url=>!(wall.hit&&pagedUrl(url)),
+
+        inspect:(reply,url)=>{
+
+            if(isSignIn(reply.url)){
+
+                hitWall(url,"a real tab was sent to the sign-in page too");
+
+                return "stop";
+
+            }
+
+            if(pagedUrl(url)) wall.cleared=true;
+
+            return "";
+
+        }
+
+    });
+
+    // enough of a url to recognise it in a status line, without the tracking query string
+    function describeUrl(url){
 
         try{
-            chrome.runtime.sendMessage({type:"indeed-crawler-status",text}).catch(()=>{});
+
+            const parsed=new URL(url,ORIGIN);
+
+            const start=parsed.searchParams.get("start");
+
+            if(start) return "the page at start="+start;
+
+            const cmp=parsed.pathname.match(/^\/cmp\/([^/]+)/);
+
+            if(cmp) return decodeURIComponent(cmp[1]).replace(/-/g," ");
+
+            const jk=parsed.searchParams.get("jk");
+
+            return jk?"job "+jk:parsed.pathname;
+
         }
-        catch(e){}
+        catch(e){
+            return url;
+        }
 
     }
 
-    // textContent + whitespace collapse: a DOMParser document is never rendered, so innerText cannot be trusted
-    function norm(el){
-        return (el&&el.textContent||"").replace(/\s+/g," ").trim();
-    }
+    // the cheap way first, then a real tab - see core.tabFirst
+    const fetchDoc=(url,tries)=>core.tabFirst(fetcher,tabs,url,settings(url,tries));
 
-    function pick(root,selector){
-        return norm(root.querySelector(selector));
+    // Dedupe by URL: two companies can share one /cmp/ page ("Capgemini" and "Capgemini Sogeti"),
+    // so it is read once and a page already in flight is shared. A FAILED result is evicted on
+    // purpose - caching null meant a company whose page was refused during the busiest minute of
+    // the run could never be read again, not even by the retry pass, and its size cell came out
+    // blank, indistinguishable from a company that publishes no headcount at all.
+    //
+    // This cache sits ABOVE the fetcher's own, because a page a tab rescued has to be shared just
+    // like a fetched one.
+    const docCache=new Map();
+
+    function fetchDocCached(url){
+
+        if(docCache.has(url)) return docCache.get(url);
+
+        const pending=fetchDoc(url).then(doc=>{
+
+            if(!doc) docCache.delete(url);
+
+            return doc;
+
+        },e=>{
+
+            docCache.delete(url);
+
+            throw e;
+
+        });
+
+        docCache.set(url,pending);
+
+        return pending;
+
     }
 
     try{
@@ -631,17 +495,10 @@
         // off unless the popup says otherwise: the /cmp/ lookup is one request per company and the
         // part of the run Indeed pushes back on hardest
         let wantEmployees=false;
-        let useProxy=false;
-
-        // Swapping on a schedule only pays off with a pool where most addresses work. Here most of
-        // them are refused, so a timed swap is as likely to walk off a good IP onto a dead one -
-        // the crawler swaps when it is actually blocked instead.
-        let rotateEvery=0;
 
         try{
 
-            const settings=await chrome.storage.local.get(
-                ["maxPages","concurrency","employees","useProxy","rotateEvery"]);
+            const settings=await chrome.storage.local.get(["maxPages","concurrency","employees"]);
 
             maxPages=+settings.maxPages||0;
 
@@ -649,54 +506,17 @@
 
             if(settings.employees===true) wantEmployees=true;
 
-            useProxy=settings.useProxy===true;
-
-            if(settings.rotateEvery!==undefined) rotateEvery=Math.max(0,+settings.rotateEvery||0);
-
         }
         catch(e){
             console.warn(LOG,"could not read settings, using defaults",e);
         }
 
         // the setting is the ceiling, not a fixed width: the gate drops below it while blocked
-        throttle.maxLimit=concurrency;
-        throttle.limit=concurrency;
+        gate.maxLimit=concurrency;
+        gate.limit=concurrency;
 
         //---------------------------------------------------
-        // 1b. route the fetches through Webshare before the first one goes out
-        //     (page 1 is read from the already loaded DOM, so it stays on the real IP either way)
-        //---------------------------------------------------
-
-        if(useProxy){
-
-            const started=await proxy.start(COUNTRY,rotateEvery);
-
-            if(started.ok){
-
-                report(`Proxy on: ${started.label} - ${started.pool} IP(s) available`);
-
-                console.log(LOG,"proxy on:",started.label);
-
-            }
-            else{
-
-                // running unproxied is still a working crawl, just the slower one - the alternative
-                // is refusing to start over a proxy the user can fix afterwards
-                report("Proxy off: "+started.error+" - continuing on the normal connection");
-
-                console.warn(LOG,"proxy could not be enabled:",started.error);
-
-            }
-
-        }
-
-        //---------------------------------------------------
-        // 2. page 1 comes straight from the open DOM (no request, no bot check),
-        //    later pages are fetched through &start=
-        //---------------------------------------------------
-
-        //---------------------------------------------------
-        // 1c. pick up an unfinished run on the same search
+        // 1b. pick up an unfinished run on the same search
         //---------------------------------------------------
 
         const saved=await checkpoint.load();
@@ -717,6 +537,11 @@
 
         }
 
+        //---------------------------------------------------
+        // 2. page 1 comes straight from the open DOM (no request, no bot check),
+        //    later pages are fetched through &start=
+        //---------------------------------------------------
+
         const first=collectFrom(document);
 
         console.log(LOG,`page 1: ${first.cards} cards -> ${first.added} jobs`);
@@ -728,11 +553,15 @@
 
         }
 
-        throttle.budget=PAGING_BUDGET;
+        // Ask now, while nothing is on fire: pagination is where Indeed refuses hardest, and a
+        // fallback that turns out to be unreachable at page 27 has already cost the run.
+        if(await tabs.ready()) console.log(LOG,"tab fallback is ready");
+
+        gate.spend(PAGING_BUDGET);
 
         const paging=await loadPages(maxPages);
 
-        throttle.budget=BLOCK_BUDGET;
+        gate.spend(BLOCK_BUDGET);
 
         console.log(LOG,`${paging.pages} page(s) read`+(paging.stoppedEarly?" (stopped early)":""));
 
@@ -756,6 +585,9 @@
         let filledTime=0;
 
         let givenUp=false;
+
+        // nothing left to try: the gate has written the fetches off AND the tab route is spent
+        const outOfRoad=()=>!tabs.available&&(gate.dead||gate.deadEnds>=BLOCK_LIMIT);
 
         if(wantEmployees){
 
@@ -817,7 +649,11 @@
                     else{
 
                         company.failed=false;
-                        company.employees=readSize(profile);
+
+                        const size=readSize(profile);
+
+                        company.employees=size.text;
+                        company.employeesSource=size.source;
 
                         if(company.employees) withSize++;
                         else if(index<3) console.warn(LOG,"no company size on",company.companyUrl);
@@ -826,13 +662,14 @@
 
                 }
 
-                // Once Indeed hard-blocks the session, every further request is wasted and the run
-                // never ends. Stop the lookup and export what we already have.
-                if((throttle.dead||throttle.deadEnds>=BLOCK_LIMIT)&&!givenUp){
+                // Once there is no route left at all - fetches written off AND the tab budget
+                // spent - every further request is wasted and the run never ends. Stop the lookup
+                // and export what we already have.
+                if(outOfRoad()&&!givenUp){
 
                     givenUp=true;
 
-                    console.warn(LOG,"Indeed is blocking the session - company size lookup stopped early");
+                    console.warn(LOG,"no route left to Indeed - company size lookup stopped early");
 
                 }
 
@@ -848,8 +685,8 @@
                 // A company refused at the busiest moment of the run is usually readable once the
                 // queue has drained and the gap has walked back down. Without this its size cell
                 // stays blank, and a blank cell reads as "this company publishes no headcount".
-                // Nothing is retried once the session is written off: every request is wasted then.
-                shouldRetry:company=>company.failed===true&&!givenUp&&!throttle.dead&&!wall.hit,
+                // Nothing is retried once there is no route left: every request is wasted then.
+                shouldRetry:company=>company.failed===true&&!givenUp&&!wall.hit&&!outOfRoad(),
                 onRetryPass:count=>report(`Retrying ${count} company page(s) that failed...`)
             });
 
@@ -873,10 +710,6 @@
 
     }
     finally{
-
-        // the PAC is a browser wide setting: leaving it behind would route every later Indeed visit
-        // through Webshare, including ones made by hand after the crawl
-        await proxy.stop();
 
         window.__indeedCrawlerRunning=false;
 
@@ -927,18 +760,25 @@
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
             +(paging.recovered?` ${paging.recovered} page(s) were recovered on a second pass.`:"")
             +(paging.skipped?` ${paging.skipped} page(s) could not be read at all.`:"")
+            +(state.wantEmployees&&core.describeSizes(companies)
+                ?`\n${core.describeSizes(companies)}`:"")
+            +(tabs.describe()?"\n"+tabs.describe():"")
+            +(tabs.off==="broken"?"\nThe tab fallback could not open tabs at all - reload the "
+                +"extension from chrome://extensions and run again.":"")
+            +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")
             +(written.clipped?`\n${written.clipped} cell(s) truncated to fit Excel's 32,767 character limit.`:"")
-            +(netErrors?`\n\n${netErrors} connection(s) dropped before Indeed answered `
+            +(fetcher.stats.netErrors?`\n\n${fetcher.stats.netErrors} connection(s) dropped before Indeed answered `
                 +"(ERR_QUIC_PROTOCOL_ERROR and friends). Those are retried, but if there are many "
                 +"of them the HTTP/3 path to Indeed is unstable: open chrome://flags, set "
                 +"'Experimental QUIC protocol' to Disabled, restart Chrome and run again.":"")
             +PAGING_NOTE(paging)
-            +(proxy.used?`\nProxy: ${proxy.rotations} IP change(s), last exit ${proxy.label||"unknown"}`
-                +(proxy.enabled?".":" (the rest of the run went out on the normal connection)."):"")
+            +(challenges?`\n\n${challenges} request(s) were answered with a Cloudflare challenge`
+                +(tabs.ok?" - which is what the tab fallback above is for.":". Open Indeed in a "
+                    +"normal tab, clear the check by hand, then run again."):"")
             +(wall.hit?"\n\nIndeed served page 1 only: everything after it is behind a sign-in "
-                +`(${wall.reason}). This is an account requirement, not a rate limit - it is `
-                +"identical on every IP, so the proxy cannot get past it. Sign in to Indeed in this "
-                +"browser and run again to read the rest of the pages.":"")
+                +`(${wall.reason}). This is an account requirement, not a rate limit, and waiting `
+                +"does not clear it. Sign in to Indeed in this browser and run again to read the "
+                +"rest of the pages.":"")
             +(state.givenUp?"\n\nIndeed blocked the session, so company size was only read for the first "
                 +`${state.processed} of ${companies.length} companies. Everything else in the file is complete. `
                 +"Wait a few minutes, or untick 'Company size' for a clean fast run.":"")
@@ -999,159 +839,102 @@
 
     async function loadPages(maxPages){
 
-        let pages=1;
-        let stoppedEarly=false;
-        let repeats=0;
-        let misses=0;
-        let rounds=0;
-
-        // pages stepped over during the walk, kept for a second pass at the end
-        const missed=[];
-
-        // why the walk ended, so the summary can say whether the list ran out or Indeed cut us off
-        let reason="end";
-
-        const limit=maxPages?Math.min(maxPages,HARD_PAGE_CAP):HARD_PAGE_CAP;
-
-        // every &start= we have already asked for, so a page that links back to itself or to an
-        // earlier one cannot put the loop in a circle
-        const seen=new Set();
-
-        // the gap between one page's start= and the next. Read from the pages themselves rather
+        // The gap between one page's start= and the next. Read from the pages themselves rather
         // than assumed, because it follows &limit= (10 on the old build, 15 on the current one).
+        // Page 1 starts at 0, so page 2's start IS the stride - known before anything is read,
+        // which is what lets even a miss on the very first page be stepped over.
         let step=0;
+        let repeats=0;
+
+        // walkPages calls every stop we ask for "empty"; this records which one it really was
+        let stopped="";
 
         // page 1 was already read from the open DOM; ask it where page 2 lives
-        let url=nextPageUrl(document,location.href);
+        const start=nextPageUrl(document,location.href);
 
-        // page 1 starts at 0, so page 2's start IS the stride - known before anything is fetched,
-        // which is what lets even a miss on the very first fetched page be stepped over
-        if(url) step=startOf(url);
+        if(start) step=core.paramOf(start,"start",ORIGIN);
 
-        // the miss path can advance without pages++, so the loop needs its own stop
-        while(url&&pages<limit&&rounds++<limit*2){
+        const walk=await core.walkPages({
 
-            if(seen.has(url)){
-                console.warn(LOG,"pagination pointed back at a page already read - stopping");
-                reason="loop";
-                break;
-            }
+            first:start,
 
-            seen.add(url);
+            // readPage, not fetcher.fetchDoc: a page Indeed refuses is reopened in a real tab
+            // before it is written off, and while paginating that is the difference between
+            // stopping at page 27 and reading all 62
+            fetchDoc:(url,opts)=>fetchDoc(url,opts&&opts.tries),
 
-            const doc=await fetchDoc(url,DELAY);
-
-            // a walled page can still parse (Cloudflare's interstitial is valid html) - it just
-            // has no jobs on it, and asking for page 3 would be pointless
-            if(wall.hit){
-                stoppedEarly=true;
-                reason="wall";
-                break;
-            }
-
-            if(!doc){
-
-                // Losing one page must not lose every page behind it. The next URL normally comes
-                // out of the page we just failed to read, so without this the run ends here - at
-                // page 27 of 60, throwing away two thirds of the list over one busy moment.
-                // The step is known from the pages that did arrive, so we can step over it.
-                const next=step?bumpStart(url,step):"";
-
-                if(++misses>=MAX_MISSES||!next){
-                    stoppedEarly=true;
-                    reason="blocked";
-                    break;
-                }
-
-                missed.push(url);
-
-                console.warn(LOG,`page after start=${startOf(url)} did not come back - skipping to`,next);
-
-                url=next;
-
-                continue;
-
-            }
-
-            misses=0;
-
-            const found=collectFrom(doc);
-
-            pages++;
-
-            report(`Page ${pages}: ${found.added} new job(s), ${jobs.length} total`);
-
-            // written as we go: a tab navigation kills the content script outright, and without
-            // this a 40 page walk that dies at page 39 leaves nothing at all behind
-            await checkpoint.save({jobs});
-
-            // 0 cards = the end of the list, or Indeed returned a bot-check page
-            if(found.cards===0){
-                console.warn(LOG,"page",pages,"had no job cards - end of results or a bot check");
-                stoppedEarly=true;
-                reason="empty";
-                break;
-            }
-
-            repeats=found.added?0:repeats+1;
-
-            if(repeats>=MAX_REPEAT_PAGES){
-                console.warn(LOG,`${repeats} pages in a row held nothing new - stopping`);
-                reason="repeat";
-                break;
-            }
-
-            const next=nextPageUrl(doc,url);
-
-            // learn the stride from two pages that really exist, so a later miss can be stepped
-            // over without guessing
-            if(next){
-
-                const gap=startOf(next)-startOf(url);
-
-                if(gap>0) step=gap;
-
-            }
-
-            url=next;
-
-        }
-
-        if(url&&pages>=limit){
-            stoppedEarly=true;
-            reason="limit";
-        }
-
-        // Second pass over the pages that were stepped over. The rate limit that cost them has had
-        // the whole rest of the list to cool off by now, so a page skipped at 48 of 62 usually
-        // comes back on the way out - which is the difference between 61 pages and all 62.
-        let skipped=missed.length;
-
-        if(missed.length&&!wall.hit&&!throttle.dead){
-
-            report(`Retrying ${missed.length} page(s) that were skipped...`);
-
-            for(const retry of missed){
-
-                const doc=await fetchDoc(retry,DELAY,RECOVERY_TRIES);
-
-                if(!doc) continue;
+            onDoc:async(doc,url,page)=>{
 
                 const found=collectFrom(doc);
 
-                pages++;
-                skipped--;
+                // the recovery pass has no page number to give - it is re-reading one that was
+                // stepped over, so say that rather than printing "Page 0"
+                report(page
+                    ?`Page ${page}: ${found.added} new job(s), ${jobs.length} total`
+                    :`Recovered ${describeUrl(url)}: ${found.added} new job(s), ${jobs.length} total`);
 
-                report(`Recovered page at start=${startOf(retry)}: ${found.added} new job(s), `
-                    +`${jobs.length} total`);
+                // written as we go: a tab navigation kills the content script outright, and
+                // without this a 40 page walk that dies at page 39 leaves nothing at all behind
+                await checkpoint.save({jobs});
 
-            }
+                // 0 cards = the end of the list, or Indeed returned a bot-check page
+                if(found.cards===0){
+                    console.warn(LOG,"a page had no job cards - end of results or a bot check");
+                    stopped="empty";
+                    return "stop";
+                }
 
-        }
+                repeats=found.added?0:repeats+1;
+
+                if(repeats>=MAX_REPEAT_PAGES){
+                    console.warn(LOG,`${repeats} pages in a row held nothing new - stopping`);
+                    stopped="repeat";
+                    return "stop";
+                }
+
+                return "";
+
+            },
+
+            nextOf:(doc,url)=>{
+
+                const next=nextPageUrl(doc,url);
+
+                // learn the stride from two pages that really exist, so a later miss can be
+                // stepped over without guessing
+                if(next){
+
+                    const gap=core.paramOf(next,"start",ORIGIN)-core.paramOf(url,"start",ORIGIN);
+
+                    if(gap>0) step=gap;
+
+                }
+
+                return next;
+
+            },
+
+            // Losing one page must not lose every page behind it: the next url normally comes out
+            // of the page we just failed to read. Once the wall is up there is nothing to step to.
+            guessNext:url=>wall.hit?"":(step?core.bumpParam(url,"start",step,ORIGIN):""),
+
+            maxPages:maxPages?Math.min(maxPages,HARD_PAGE_CAP):HARD_PAGE_CAP,
+            maxMisses:MAX_MISSES,
+            recoveryTries:RECOVERY_TRIES,
+            report,
+            log:LOG
+
+        });
 
         await checkpoint.save({jobs},true);
 
-        return {pages,stoppedEarly,skipped,recovered:missed.length-skipped,reason};
+        return {
+            pages:walk.pages,
+            skipped:walk.skipped,
+            recovered:walk.recovered,
+            stoppedEarly:walk.reason!=="end",
+            reason:wall.hit?"wall":(stopped||walk.reason)
+        };
 
     }
 
@@ -1174,35 +957,6 @@
 
     }
 
-    function startOf(url){
-
-        try{
-            return +new URL(url,ORIGIN).searchParams.get("start")||0;
-        }
-        catch(e){
-            return 0;
-        }
-
-    }
-
-    // the same URL one page further on
-    function bumpStart(url,step){
-
-        try{
-
-            const next=new URL(url,ORIGIN);
-
-            next.searchParams.set("start",String(startOf(url)+step));
-
-            return next.toString();
-
-        }
-        catch(e){
-            return "";
-        }
-
-    }
-
     //---------------------------------------------------
     // helper: the URL of the page after `fromUrl`, taken from that page's own pagination.
     // Reading it instead of computing start+10 is what keeps a limit=15 search from being crawled
@@ -1213,10 +967,10 @@
 
         const next=root.querySelector('a[data-testid="pagination-page-next"][href]');
 
-        if(next) return absolute(next.getAttribute("href"));
+        if(next) return new URL(next.getAttribute("href"),ORIGIN).toString();
 
         // some builds render only the numbered links: take the lowest start still ahead of us
-        const here=+new URL(fromUrl,ORIGIN).searchParams.get("start")||0;
+        const here=core.paramOf(fromUrl,"start",ORIGIN);
 
         let best="";
         let bestStart=Infinity;
@@ -1235,10 +989,6 @@
 
         return best;
 
-    }
-
-    function absolute(href){
-        return new URL(href,ORIGIN).toString();
     }
 
     //---------------------------------------------------
@@ -1394,49 +1144,92 @@
 
         }
 
-        if(results.length) console.log(LOG,`read ${results.length} card(s) from the embedded JSON`);
-
         return {cards:results.length,added};
 
     }
 
     function jobCardsJson(root){
 
+        if(cardsJson.has(root)) return cardsJson.get(root);
+
+        const results=readCardsJson(root);
+
+        cardsJson.set(root,results);
+
+        if(results.length) console.log(LOG,`read ${results.length} card(s) from the embedded JSON`);
+
+        return results;
+
+    }
+
+    function readCardsJson(root){
+
+        let sawKey=false;
+
         for(const script of root.querySelectorAll("script")){
 
             const text=script.textContent||"";
 
-            const at=text.indexOf('"mosaic-provider-jobcards"');
+            // EVERY occurrence, not just the first. The name also appears in provider manifests
+            // and config arrays earlier in the page; the old code locked onto the first one, took
+            // the next "=" - which belonged to an unrelated statement - and handed JSON.parse a
+            // JavaScript object literal with unquoted keys. That is the "Expected property name
+            // at position 1" error, and it cost the page every posting date on it.
+            for(let at=text.indexOf(CARDS_KEY);at>=0;at=text.indexOf(CARDS_KEY,at+CARDS_KEY.length)){
 
-            if(at<0) continue;
+                sawKey=true;
 
-            const assign=text.indexOf("=",at);
+                const results=cardsAt(text,at+CARDS_KEY.length);
 
-            if(assign<0) continue;
+                if(results) return results;
 
-            const open=text.indexOf("{",assign);
-
-            if(open<0) continue;
-
-            const raw=balanced(text,open);
-
-            if(!raw) continue;
-
-            try{
-
-                const data=JSON.parse(raw);
-                const model=data&&data.metaData&&data.metaData.mosaicProviderJobCardsModel;
-
-                if(model&&Array.isArray(model.results)) return model.results;
-
-            }
-            catch(e){
-                console.warn(LOG,"could not parse the embedded job card JSON",e);
             }
 
         }
 
+        if(sawKey&&!cardsJsonWarned){
+
+            cardsJsonWarned=true;
+
+            console.warn(LOG,"the embedded job card JSON is on the page but no longer in a shape "
+                +"this can read - posting dates will be missing. The card markup is unaffected.");
+
+        }
+
         return [];
+
+    }
+
+    // the model at `from`, or null if what is there is not one
+    function cardsAt(text,from){
+
+        const open=text.indexOf("{",from);
+
+        if(open<0||open-from>CARDS_LEAD_MAX) return null;
+
+        // only an assignment or a key may sit between the name and the brace
+        if(!CARDS_LEAD.test(text.slice(from,open))) return null;
+
+        const raw=balanced(text,open);
+
+        if(!raw) return null;
+
+        try{
+
+            const data=JSON.parse(raw);
+            const model=data&&data.metaData&&data.metaData.mosaicProviderJobCardsModel;
+
+            return model&&Array.isArray(model.results)?model.results:null;
+
+        }
+        catch(e){
+
+            // not the payload - another occurrence of the name may still be. Silent on purpose:
+            // this is a candidate being rejected, not a failure, and warning per candidate is
+            // what filled the console.
+            return null;
+
+        }
 
     }
 
@@ -1619,7 +1412,9 @@
                     postedAge:Infinity,
                     jobUrl:job.jobUrl,
                     companyUrl:job.companyUrl||"",
-                    employees:""
+                    employees:"",
+                    // "label" | "near" | "" - see core.headcount
+                    employeesSource:""
                 };
 
                 map.set(key,company);
@@ -1662,8 +1457,9 @@
 
         if(!text.trim()) return "";
 
-        if(/hybrid|混合/i.test(text)) return "Hybrid";
-        if(/remote|work from home|遙距|遥距|遠端|远程|在家工作|homeoffice|home-office|telearbeit/i.test(text)) return "Remote";
+        // hybrid first: "hybrid work from home" contains both
+        if(HYBRID.test(text)) return "Hybrid";
+        if(REMOTE.test(text)) return "Remote";
 
         return "Onsite";
 
@@ -1674,23 +1470,18 @@
     // "Size" + "51 to 200", or the sentence "51 to 200 employees"
     //---------------------------------------------------
 
+    // Returns {text,source}. The "Size" label with the value in the next block is the reading
+    // that can only be one thing; the fallback is a small element that IS the value. What is gone
+    // is norm(doc.body).match(...), which turned any number on the profile page - a salary band,
+    // a review count, "10+ years" from a testimonial - into the company's headcount, in a cell
+    // indistinguishable from a real one.
     function readSize(doc){
 
-        for(const el of doc.querySelectorAll('[data-testid*="employee" i], [data-testid*="companyInfo" i], li, tr')){
-
-            const parts=blocks(el);
-
-            for(let i=0;i+1<parts.length;i++){
-
-                if(SIZE_LABEL.test(parts[i])&&parts[i+1]) return parts[i+1];
-
-            }
-
-        }
-
-        const body=norm(doc.body).match(SIZE_DOC);
-
-        return body?body[0]:"";
+        return core.headcount(doc,{
+            label:SIZE_LABEL,
+            value:SIZE_VALUE,
+            scope:'[data-testid*="employee" i],[data-testid*="companyInfo" i],li,tr,td,dd,dt,p,span,div'
+        });
 
     }
 
@@ -1709,290 +1500,6 @@
         // /cmp/ links sometimes point at another country's domain (www.indeed.com) -> pull them
         // back to the open root so they match host_permissions and the page language.
         return ORIGIN+(slug?slug[0]:url.pathname);
-
-    }
-
-    //---------------------------------------------------
-    // helper: split text per text node, so words do not run together when the
-    // markup has no whitespace between tags
-    //---------------------------------------------------
-
-    function blocks(el){
-
-        const parts=[];
-
-        (function walk(node){
-
-            for(const child of node.childNodes){
-
-                if(child.nodeType===3){
-
-                    const text=(child.nodeValue||"").replace(/\s+/g," ").trim();
-
-                    if(text) parts.push(text);
-
-                }
-                else if(child.nodeType===1){
-                    walk(child);
-                }
-
-            }
-
-        })(el);
-
-        return parts;
-
-    }
-
-    //---------------------------------------------------
-    // helper: fetch + parse, backing off automatically when rate limited
-    // Indeed answers 403 when it suspects a bot -> treat that as a rate limit and retry too.
-    //---------------------------------------------------
-
-    // `tries` overrides the attempt budget - used by the recovery pass, where the page has already
-    // had the full ladder once and a second one would cost more than the page is worth
-    async function fetchDoc(url,pace,tries){
-
-        // once the session is blocked outright, retrying only makes the run longer, never better
-        if(throttle.dead) return null;
-
-        // and once Indeed has told us the rest of the list needs an account, every further page
-        // request gets the same answer
-        if(wall.hit&&pagedUrl(url)) return null;
-
-        // While things are degrading every URL gets two tries instead of six, so we find out fast -
-        // except a paginated page, which is worth the full ladder even then: it carries fifteen
-        // jobs and, until it comes back, no way of knowing where the page after it starts.
-        const attempts=tries||(throttle.blocks>=3&&!pagedUrl(url)?2:MAX_ATTEMPTS);
-
-        // which exit IPs this one URL has already been refused on. Two different addresses giving
-        // the same answer is the proof that the address was never the reason.
-        const refusedOn=new Set();
-
-        // connections that died before Indeed answered, counted separately from refusals
-        let transportFails=0;
-
-        for(let attempt=1;attempt<=attempts;attempt++){
-
-            if(throttle.dead) break;
-
-            // the wait lives BEFORE the request: that is the only place it can cap the send rate.
-            // Waiting afterwards (as it used to) left the retries of a 429 completely unpaced.
-            await throttle.enter(pace);
-
-            // read BEFORE the request goes out: by the time it comes back the crawler may already
-            // be on a different IP, and this is the one the answer belongs to
-            const seat=proxy.seat;
-
-            let response;
-
-            try{
-
-                // A bare fetch() sends "Accept: */*" and no referrer, which reads as an API client.
-                // Asking for html from the page we are already on looks like an ordinary page load.
-                response=await fetch(url,{
-                    credentials:"include",
-                    referrer:location.href,
-                    headers:{"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-                });
-
-            }
-            catch(e){
-
-                throttle.leave();
-
-                netErrors++;
-                transportFails++;
-
-                console.warn(LOG,`fetch failed (${transportFails}/${MAX_TRANSPORT_TRIES})`,
-                    url,e&&e.message||e);
-
-                // A rejected fetch is the connection dying, not an answer: there is no status and
-                // it says nothing about pace, so it must not widen the gap or count as a block.
-                //
-                // ERR_QUIC_PROTOCOL_ERROR / QUIC_TOO_MANY_RTOS is the usual one. Indeed advertises
-                // HTTP/3, so Chrome talks to it over UDP, and a path that starts losing packets
-                // takes the whole session down with it. Chrome retires a broken h3 session after a
-                // few failures and falls back to TCP - which is exactly why retrying works, and
-                // why giving up on the first one was wrong: it cost a whole page, and while
-                // paginating, the link to every page behind it.
-                if(transportFails<MAX_TRANSPORT_TRIES&&attempt<attempts){
-
-                    await sleep(TRANSPORT_PAUSE*transportFails+Math.random()*300);
-
-                    continue;
-
-                }
-
-                return null;
-
-            }
-
-            // Indeed hands page 1 of a search to anyone and sends every later page to a sign-in
-            // ("branding=page-two-signin"). That redirect is the wall the crawler keeps hitting;
-            // it is the same on every address, so it must never be mistaken for a block.
-            if(signInWall(response)){
-
-                throttle.leave();
-
-                hitWall(url,"redirected to the Indeed sign-in page");
-
-                return null;
-
-            }
-
-            if(response.status===429||response.status===503||response.status===403){
-
-                throttle.leave();
-
-                refusedOn.add(seat||"direct");
-
-                // Page 2 of a search is refused to every visitor on every address - measured on
-                // sg, au, hk, uk and de, proxied and direct alike. So once one of those pages has
-                // been refused on two different exit IPs there is nothing left to learn: more
-                // rotations would spend the pool proving the same point, and retiring those IPs
-                // would empty it over something they did not do.
-                //
-                // Two refusals are enough whether or not the address changed in between: with a
-                // proxy that is two different IPs saying the same thing, and without one it is the
-                // same wall twice. Either way the remaining four attempts and their forty seconds
-                // of cooldown buy nothing.
-                //
-                // Narrow on purpose, because calling something a wall ends the crawl:
-                //   * only 403 - a 429 or 503 is pace, not permission, and clears by waiting. One
-                //     busy moment at page 27 must not be read as "you need an account";
-                //   * only paged URLs - everywhere else a refusal really can be about the address,
-                //     and the pool has to be walked to find that out;
-                //   * only while no paginated page has ever come back. One that did is proof the
-                //     way is open, so whatever this is, it is not the sign-in wall.
-                if(response.status===403&&pagedUrl(url)&&!wall.cleared&&attempt>=2){
-
-                    throttle.release(0);
-
-                    hitWall(url,refusedOn.size>1
-                        ?`HTTP 403 on ${refusedOn.size} different exit IPs`
-                        :"HTTP 403 on every attempt");
-
-                    return null;
-
-                }
-
-                // A new IP is a new rate limit budget, so ask for one before deciding how long to
-                // wait. Everyone is parked first: a sibling request that slips out mid-swap still
-                // travels on the IP we are leaving behind.
-                if(proxy.enabled&&!proxy.exhausted) throttle.hold(ROTATE_HOLD);
-
-                // Cloudflare labels its own 403s, and "challenge" normally means the exit IP was
-                // refused before Indeed ever looked at the request - grounds to retire it.
-                // But only a page anyone may read can testify about an address. A paged search
-                // result is refused to every visitor, so a challenge on one says nothing about the
-                // IP that asked, and retiring the pool over it is how a good IP gets thrown away.
-                const challenged=response.headers.get("cf-mitigated")==="challenge";
-
-                const reason=challenged&&!pagedUrl(url)?"challenge":response.status;
-
-                const wasProxied=proxy.enabled;
-
-                const rotated=await proxy.rotate(reason,seat);
-
-                // dropping the proxy altogether changes the exit IP just as much as swapping it:
-                // the retry leaves on the real address, which is not the one that was blocked
-                const moved=rotated||(wasProxied&&!proxy.enabled);
-
-                // a failed swap leaves the hold behind, and it would silently stand in for the
-                // real backoff penalize is about to work out
-                if(!moved) throttle.release(0);
-
-                // parks every worker, so the retry does not go out with five siblings
-                throttle.penalize(retryAfter(response),moved,attempt===1);
-
-                continue;
-
-            }
-
-            if(!response.ok){
-
-                throttle.leave();
-
-                console.warn(LOG,"HTTP",response.status,url);
-
-                return null;
-
-            }
-
-            let html;
-
-            try{
-                html=await response.text();
-            }
-            finally{
-                throttle.leave();
-            }
-
-            throttle.relax();
-
-            if(pagedUrl(url)) wall.cleared=true;
-
-            // moving off an IP BEFORE it collects a block is cheaper than the block: no cooldown,
-            // no lost request, and Indeed never sees enough traffic from one address to act on
-            await proxy.onSuccess();
-
-            return new DOMParser().parseFromString(html,"text/html");
-
-        }
-
-        throttle.deadEnds++;
-
-        console.warn(LOG,`gave up after ${attempts} blocked attempts`,url);
-
-        return null;
-
-    }
-
-    // Dedupe by URL: the same page is never fetched twice, and a page already in flight is shared.
-    //
-    // A FAILED result is evicted on purpose. Caching null meant a company whose /cmp/ page was
-    // refused once, during the busiest minute of the run, could never be read again - not by the
-    // retry pass, not by anything - and its size cell came out blank, indistinguishable from a
-    // company that publishes no headcount at all.
-    function fetchDocCached(url,pace){
-
-        if(docCache.has(url)) return docCache.get(url);
-
-        const pending=fetchDoc(url,pace).then(doc=>{
-
-            if(!doc) docCache.delete(url);
-
-            return doc;
-
-        },e=>{
-
-            docCache.delete(url);
-
-            throw e;
-
-        });
-
-        docCache.set(url,pending);
-
-        return pending;
-
-    }
-
-    // Retry-After is either a number of seconds or an HTTP date
-    function retryAfter(response){
-
-        const header=response.headers.get("retry-after");
-
-        if(!header) return 0;
-
-        const seconds=+header;
-
-        if(seconds>0) return Math.min(MAX_COOLDOWN,seconds*1000);
-
-        const when=Date.parse(header);
-
-        return when?Math.min(MAX_COOLDOWN,Math.max(0,when-Date.now())):0;
 
     }
 

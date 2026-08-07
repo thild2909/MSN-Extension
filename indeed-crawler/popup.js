@@ -4,10 +4,6 @@ const maxPages = document.getElementById("maxPages");
 const employees = document.getElementById("employees");
 const concurrency = document.getElementById("concurrency");
 
-const useProxy = document.getElementById("useProxy");
-const proxyTest = document.getElementById("proxyTest");
-const proxyStatus = document.getElementById("proxyStatus");
-
 const INDEED_ROOT = /^https:\/\/(sg|au|hk|uk|my|de)\.indeed\.com\//;
 
 // content.js clamps this too; here it only keeps the input from accepting absurd numbers
@@ -22,117 +18,32 @@ async function save() {
     await chrome.storage.local.set({
         maxPages: Math.max(0, parseInt(maxPages.value, 10) || 0),
         employees: employees.checked,
-        concurrency: parallelValue(),
-        useProxy: useProxy.checked
+        concurrency: parallelValue()
     });
-
-}
-
-// the popup is a separate page from the worker, so anything that touches the proxy is a message
-async function ask(message) {
-
-    try {
-        return (await chrome.runtime.sendMessage(message)) || { ok: false, error: "no reply from the extension worker" };
-    }
-    catch (e) {
-        return { ok: false, error: e && e.message || String(e) };
-    }
-
-}
-
-// the root of the open tab decides which country's proxy is preferred (uk -> GB, de -> DE)
-async function currentCountry() {
-
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-    const match = INDEED_ROOT.exec(tab && tab.url || "");
-
-    return match ? match[1] : "";
-
-}
-
-async function showProxyStatus() {
-
-    const state = await ask({ type: "proxy:status" });
-
-    if (!state.ok) {
-        proxyStatus.textContent = state.error;
-        return;
-    }
-
-    if (state.enabled) {
-        proxyStatus.textContent = `On - ${state.label}, ${state.rotations} swap(s), ${state.pool} usable IP(s) left.`;
-        return;
-    }
-
-    if (!state.total) {
-        proxyStatus.textContent = "Proxy list not loaded yet - press Check IPs.";
-        return;
-    }
-
-    proxyStatus.textContent = `${state.pool} of ${state.total} IP(s) usable. `
-        + "Applied only while a crawl is running.";
 
 }
 
 async function init() {
 
-    const settings = await chrome.storage.local.get(
-        ["maxPages", "employees", "concurrency", "useProxy"]);
+    const settings = await chrome.storage.local.get(["maxPages", "employees", "concurrency"]);
 
     if (settings.maxPages) maxPages.value = settings.maxPages;
     if (settings.concurrency) concurrency.value = settings.concurrency;
 
-    // both of these are off until asked for, so an absent setting must read as unticked rather
-    // than leaving whatever the markup happened to ship with
+    // off until asked for, so an absent setting must read as unticked rather than leaving
+    // whatever the markup happened to ship with
     employees.checked = settings.employees === true;
-
-    useProxy.checked = settings.useProxy === true;
 
     maxPages.addEventListener("change", save);
     employees.addEventListener("change", save);
     concurrency.addEventListener("change", save);
-    useProxy.addEventListener("change", save);
 
-    await showProxyStatus();
+    // Left behind by the proxy build. Harmless, but one of them is a Webshare API key, so it
+    // should not sit in the profile of an extension that no longer has any use for it.
+    chrome.storage.local.remove(
+        ["useProxy", "rotateEvery", "webshareKey", "webshareList", "webshareListAt"]);
 
 }
-
-// Walks every IP in the plan against the real Indeed search page. Indeed is behind Cloudflare and
-// refuses a lot of datacentre addresses outright, so the number that matters is not how many
-// proxies the plan has - it is how many of them Indeed answers. The refused ones are retired here
-// so a crawl never spends a request finding out.
-proxyTest.addEventListener("click", async () => {
-
-    proxyTest.disabled = true;
-    proxyStatus.textContent = "Checking every IP against Indeed - this takes a moment...";
-
-    try {
-
-        await save();
-
-        const result = await ask({ type: "proxy:audit", country: await currentCountry() });
-
-        if (!result.ok) {
-            proxyStatus.textContent = "Failed: " + result.error;
-            return;
-        }
-
-        const usable = result.good.length;
-
-        proxyStatus.textContent = usable
-            ? `${usable} of ${result.total} IP(s) get through: ${result.good.join("; ")}.`
-                + (result.walled ? ` ${result.walled} blocked by Cloudflare.` : "")
-                + (result.dead ? ` ${result.dead} did not answer.` : "")
-            : `None of the ${result.total} IP(s) get past Indeed's Cloudflare `
-                + "- leave the rotation off, or replace the proxies in the Webshare dashboard.";
-
-    }
-    finally {
-        proxyTest.disabled = false;
-    }
-
-});
 
 button.addEventListener("click", async () => {
 

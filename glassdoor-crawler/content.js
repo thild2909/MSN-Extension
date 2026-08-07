@@ -45,14 +45,35 @@
     // upper bound for when the page reports a huge job count or each click loads very little
     const MAX_AUTO_CLICKS=100;
 
-    // maximum wait per click, checked every POLL ms
+    // The longest a batch is ever given, used until enough real batches have been seen to know
+    // what "normal" is here. After that the wait is derived from what this search actually does -
+    // see batchTimeout(). A flat 15s was paid three times over at the end of every run, because
+    // the last thing a click loop does is wait out three timeouts to prove the list has ended.
     const LOAD_TIMEOUT=15000;
-    const POLL=250;
 
-    // Settle time after a click that ALREADY grew the list. waitFor has confirmed the new batch
-    // rendered by the time this runs, so it only covers the tail of the same batch - the old flat
-    // 600ms was pure waiting, ~40 seconds across a 65 click run.
-    const CLICK_SETTLE=120;
+    // ...but never less than this, however fast the batches have been: one slow response at the
+    // end of a run must not be read as "the list is finished".
+    const MIN_TIMEOUT=3000;
+
+    // how many batches are enough to know what a normal one costs here
+    const TIMING_SAMPLE=3;
+
+    // How long the card count has to stop growing before a batch counts as fully rendered.
+    //
+    // This is a detection interval, not a toll: there is no way to know changes have stopped
+    // except by watching a quiet moment go by. It is now as short as that idea allows, because it
+    // no longer has to protect the tail of the final batch - crawlAllPages reads once more after
+    // the loop for that. All it still buys is not clicking again mid-render.
+    const BATCH_SETTLE=30;
+
+    // Belt and braces behind the MutationObserver, for the two cases where watching alone is not
+    // enough: a list rendered into a closed shadow root produces no mutations we can see, and a
+    // page with something always moving on it (an ad slot, a lazy image, a countdown) never gives
+    // the settle above its 80 quiet milliseconds.
+    //
+    // Deliberately the same interval the old poll used, so this change cannot be slower than what
+    // it replaces in any case - the observer only ever gets there first.
+    const BACKSTOP_POLL=250;
 
     // how many times a click that did not grow the list is worth trying again before the list is
     // treated as finished. Glassdoor's button occasionally no-ops when it scrolls out of view.
@@ -87,6 +108,52 @@
     const WORKER_GIVE_UP=5;
 
     let workerFailures=0;
+
+    // Both of these are read by functions that run while the try block below is still executing,
+    // so they have to be initialised before it - a const sitting next to the function that uses it
+    // at the end of the file is still in its temporal dead zone and throws on first use.
+
+    // how long each "Show more jobs" batch actually took, so the timeout can stop being a guess
+    const batchMs=[];
+
+    // readOverview walks the document three times looking for three different layouts, and it was
+    // being run twice on every page that came back: once to decide whether the page was worth
+    // keeping, then again to read it. On a run with several hundred companies that is several
+    // hundred needless passes over a full job page.
+    const overviews=new WeakMap();
+
+    const SAMESITE_PROBE=4;
+
+    const sameSite={
+
+        tried:0,
+        hits:0,
+
+        worked(){
+            this.tried++;
+            this.hits++;
+        },
+
+        missed(){
+            this.tried++;
+        },
+
+        get worthGuessing(){
+            return this.hits>0||this.tried<SAMESITE_PROBE;
+        },
+
+        describe(){
+
+            if(!this.tried) return "";
+
+            return this.hits
+                ?`Same-site: ${this.hits}/${this.tried} listings read from ${HOST} directly`
+                :`Same-site: the ${this.tried} guesses at ${HOST} carried nothing, so the rest went `
+                    +"straight to the site the jobs live on";
+
+        }
+
+    };
 
     const startedAt=performance.now();
 
@@ -165,8 +232,31 @@
                 text:async()=>reply.html||""
             };
 
-        }
+        },
 
+        // Two refusals in a row are answered by a real navigation, not by the rest of the ladder -
+        // but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available
+
+    });
+
+    // A 429/403/5xx is often "that did not look like a browser" rather than "too fast", and no
+    // amount of backing off answers it. Reopening the URL as a real navigation does, and if the
+    // check needs a person the tab is put in front of them - once, for the whole site.
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report,
+        lastStatus:fetcher.lastStatus,
+        describe:url=>{
+
+            try{
+                return new URL(url).pathname;
+            }
+            catch(e){
+                return url;
+            }
+
+        }
     });
 
     // A tab navigation kills the content script outright - no catch block runs and nothing is
@@ -302,7 +392,11 @@
 
             company.failed=false;
 
-            const doc=company.jobUrl?await fetchDoc(company.jobUrl):null;
+            // a copy of this listing on the local domain is only worth having if it actually
+            // carries the overview - that block is the entire reason for the request
+            const doc=company.jobUrl
+                ?await fetchDoc(company.jobUrl,{accept:page=>Object.keys(overviewOf(page)).length>0})
+                :null;
 
             if(!doc){
 
@@ -315,7 +409,7 @@
             }
             else{
 
-                const overview=readOverview(doc);
+                const overview=overviewOf(doc);
 
                 company.industry=overview.industry||"";
                 company.revenue=overview.revenue||"";
@@ -435,6 +529,8 @@
                 +(state.droppedUnknown?` (${state.droppedUnknown} of them had no size)`:""):"")
             +"."
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
+            +(sameSite.describe()?`\n${sameSite.describe()}`:"")
+            +(tabs.describe()?`\n${tabs.describe()}`:"")
             +(written.clipped?`\n${written.clipped} cell(s) truncated to fit Excel's 32,767 character limit.`:"")
             +(state.crashed?`\n\nThe run stopped early: ${state.crashed}.`
                 +"\nEverything collected before that point is in the file above.":"");
@@ -569,12 +665,18 @@
             // scroll to the button to be safe: Glassdoor only loads more when it is in the viewport
             if(button.scrollIntoView) button.scrollIntoView({block:"center"});
 
+            const started=performance.now();
+
             button.click();
 
             clicks++;
 
-            // wait for the new batch to appear before reading again and clicking once more
-            const grew=await waitFor(()=>countCards()>before,LOAD_TIMEOUT);
+            // wait for the new batch to appear AND finish rendering before reading it and clicking
+            // again. The wait ends the moment the DOM stops changing, so a fast batch is not made
+            // to sit out a fixed poll interval and a slow one is not read half-written.
+            const grew=await waitForBatch(before,batchTimeout());
+
+            if(grew) batchMs.push(performance.now()-started);
 
             if(!grew){
 
@@ -603,10 +705,19 @@
 
             await checkpoint.save({jobs});
 
-            // the batch has already rendered by now; this only covers its tail
-            await sleep(CLICK_SETTLE);
-
         }
+
+        // One last read, after the loop has decided the list is over.
+        //
+        // Every round reads at the TOP, so a batch that was still rendering when it was read is
+        // picked up by the next round - except the final one, which has no next round. That made
+        // the settle inside waitForBatch load-bearing for data rather than just for pacing: cut it
+        // and the tail of the last batch was silently lost. Reading once more here costs one pass
+        // over cards that are nearly all in `visited` already, and takes that job away from a
+        // timing constant, where it never belonged.
+        const last=collectFrom(document);
+
+        if(last.added) console.log(LOG,`${last.added} card(s) arrived after the last batch was read`);
 
         return {clicks,rounds,cards:countCards(),stoppedEarly};
 
@@ -616,20 +727,91 @@
         return document.querySelectorAll(CARD).length;
     }
 
-    // wait for the condition to hold, returning false on timeout
-    async function waitFor(test,timeout){
+    //---------------------------------------------------
+    // how long to give a batch
+    //
+    // The flat 15 second ceiling was only ever right for the LAST three clicks of a run - the ones
+    // that are waiting to find out the list has ended. Every other click finishes in a second or
+    // two, and the ceiling never applied to them. But the last three always paid it in full, so
+    // ending a run cost 45 seconds of watching nothing happen.
+    //
+    // Once a few real batches have been timed, the ceiling comes from them instead: four times the
+    // slowest one seen. That is far more patient than any batch has actually needed and far less
+    // patient than 15 seconds, and on a genuinely slow connection it grows by itself.
+    //---------------------------------------------------
 
-        const deadline=Date.now()+timeout;
+    function batchTimeout(){
 
-        while(Date.now()<deadline){
+        if(batchMs.length<TIMING_SAMPLE) return LOAD_TIMEOUT;
 
-            if(test()) return true;
+        const slowest=Math.max.apply(null,batchMs);
 
-            await sleep(POLL);
+        return Math.min(LOAD_TIMEOUT,Math.max(MIN_TIMEOUT,slowest*4));
 
-        }
+    }
 
-        return false;
+    //---------------------------------------------------
+    // wait for the next batch of cards to arrive and finish rendering
+    //
+    // This used to be a 250ms poll that ran document.querySelectorAll over the whole page every
+    // time - on a list that grows to a thousand cards, four full-document scans a second for the
+    // entire run - and then slept a further flat 120ms in case the batch was not done. Watching
+    // the DOM instead costs nothing while nothing is happening, notices the batch the moment it
+    // lands, and knows it is complete when the changes stop.
+    //---------------------------------------------------
+
+    function waitForBatch(before,timeout){
+
+        return new Promise(resolve=>{
+
+            let settle=null;
+            let backstop=null;
+            let cap=null;
+            let done=false;
+
+            const finish=grew=>{
+
+                if(done) return;
+
+                done=true;
+
+                clearTimeout(settle);
+                clearInterval(backstop);
+                clearTimeout(cap);
+
+                observer.disconnect();
+
+                resolve(grew);
+
+            };
+
+            // counting is the expensive part, so it happens once per quiet moment rather than
+            // once per mutation - a batch of thirty cards is thirty mutations and one count
+            const check=()=>{
+                if(countCards()>before) finish(true);
+            };
+
+            const observer=new MutationObserver(()=>{
+
+                clearTimeout(settle);
+
+                settle=setTimeout(check,BATCH_SETTLE);
+
+            });
+
+            // The list is re-rendered by React rather than appended to in place, so the container
+            // itself can be replaced. Watching the document covers both, and the debounce above is
+            // what keeps that from being expensive.
+            observer.observe(document.documentElement,{childList:true,subtree:true});
+
+            backstop=setInterval(check,BACKSTOP_POLL);
+
+            cap=setTimeout(()=>finish(countCards()>before),timeout);
+
+            // the batch may have landed between the click and this line
+            check();
+
+        });
 
     }
 
@@ -725,6 +907,22 @@
     // The class names are hashed per build, so match on the stable part only, case-insensitively
     // ("overviewItem" vs "companyOverviewItem").
     //---------------------------------------------------
+
+    function overviewOf(doc){
+
+        let found=overviews.get(doc);
+
+        if(!found){
+
+            found=readOverview(doc);
+
+            overviews.set(doc,found);
+
+        }
+
+        return found;
+
+    }
 
     function readOverview(doc){
 
@@ -905,19 +1103,87 @@
     // we are already on -> ask our own origin first, and keep the original URL as a fallback.
     //---------------------------------------------------
 
+    // Three ways to get one page, cheapest first.
+    //
+    // `opts.accept` decides whether a page that came back is the page we wanted. Without it the
+    // same-site guess won: Glassdoor answers an unknown /job-listing/ path on the local domain
+    // with a 200 that carries no Company overview, and `if(doc) return doc` then took it and
+    // never tried the real URL - so the row came out blank while the listing was readable all
+    // along. A rejected candidate is still kept, in case nothing better arrives.
+    //
+    // Only once BOTH plain fetches have been refused is a tab opened, and only for the original
+    // URL: a tab load is seconds rather than milliseconds, so spending two of them on the same
+    // listing would be paying twice for one answer.
     async function fetchDoc(url,opts){
 
-        for(const candidate of sameSiteFirst(url)){
+        const candidates=sameSiteFirst(url);
+        const accept=opts&&opts.accept;
 
-            const doc=await fetcher.fetchDoc(candidate,opts);
+        // Every recent page has needed a tab, so walking the candidates first would only be delay:
+        // none of them are coming back either. core.tabFirst does this for the crawlers whose
+        // fetchDoc is a single URL; this one has to do it itself because it has candidates.
+        if(tabs.preferred){
 
-            if(doc) return doc;
+            const early=await tabs.fetchDoc(candidates[candidates.length-1]);
+
+            if(early) return early;
 
         }
 
-        return null;
+        let fallback=null;
+
+        for(let i=0;i<candidates.length;i++){
+
+            const guess=i<candidates.length-1;
+
+            const doc=await fetcher.fetchDoc(candidates[i],opts);
+
+            if(!doc){
+
+                if(guess) sameSite.missed();
+
+                continue;
+
+            }
+
+            tabs.clean();
+
+            // the last candidate is the original URL: there is nothing left to prefer over it
+            if(!accept||!guess||accept(doc)){
+
+                if(guess) sameSite.worked();
+
+                return doc;
+
+            }
+
+            sameSite.missed();
+
+            console.warn(LOG,"same-site copy had no company overview, trying",candidates[i+1]);
+
+            fallback=fallback||doc;
+
+        }
+
+        if(fallback) return fallback;
+
+        return tabs.fetchDoc(candidates[candidates.length-1]);
 
     }
+
+    //---------------------------------------------------
+    // is the same-site guess worth making?
+    //
+    // Rewriting a .com.au job URL onto the site we are already on is free when it works, because
+    // the request stays same-origin and keeps the page's cookies. When it does NOT work it costs a
+    // whole extra request per company, and whether it works is a property of the search, not of
+    // the listing: either this domain mirrors the region's job pages or it does not.
+    //
+    // So it is measured once instead of assumed every time. After PROBE guesses with nothing to
+    // show for them the crawler stops making it, which halves the requests in the detail phase -
+    // the longest part of a Glassdoor run. One success is enough to keep it: it means the mirror
+    // is real and the misses were something else.
+    //---------------------------------------------------
 
     function sameSiteFirst(url){
 
@@ -934,7 +1200,10 @@
 
         const local=new URL(target.pathname+target.search,ORIGIN).toString();
 
-        return workerFailures>=WORKER_GIVE_UP?[local]:[local,url];
+        // the worker refusing cross-site reads leaves the local copy as the only thing left to try
+        if(workerFailures>=WORKER_GIVE_UP) return [local];
+
+        return sameSite.worthGuessing?[local,url]:[url];
 
     }
 

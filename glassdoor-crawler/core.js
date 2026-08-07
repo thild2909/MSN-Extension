@@ -215,10 +215,17 @@ window.CrawlerCore = (function(){
                 const cool=Math.min(this.maxCooldown,
                     Math.max(retryMs||0,1500*Math.pow(2,Math.min(5,this.blocks-1))));
 
-                this.pausedUntil=Math.max(this.pausedUntil,performance.now()+cool+Math.random()*400);
+                const until=Math.max(this.pausedUntil,performance.now()+cool+Math.random()*400);
 
-                // being refused means we are running too wide as well as too fast
-                if(this.limit>1) this.limit--;
+                this.pausedUntil=until;
+
+                // Being refused means we are running too wide as well as too fast - but only a NEW
+                // request being refused says that. This was outside the `widen` guard while the
+                // gap was inside it, so one unhappy URL retried five times narrowed the pool five
+                // times: parallel 6 collapsed to 1 on a single bad page, and since relax() only
+                // widens once per three clean answers it took fifteen good pages to undo. Exactly
+                // the multiplication the comment above says must not happen, on the other lever.
+                if(widen&&this.limit>1) this.limit--;
 
                 // every cooldown since the last request that actually came back
                 this.paidOut+=cool;
@@ -227,11 +234,28 @@ window.CrawlerCore = (function(){
 
                     this.dead=true;
 
-                    return {cool,dead:true};
+                    return {cool,dead:true,until};
 
                 }
 
-                return {cool,dead:false};
+                return {cool,dead:false,until};
+
+            },
+
+            // The caller has decided not to wait this one out - it has a better answer than
+            // waiting, a real navigation in a tab. Parking every OTHER worker for a cooldown
+            // nobody is going to serve is pure loss: a single 502 on one company page was pausing
+            // the whole pool for thirty seconds on the way to a fallback that does not need it.
+            //
+            // Only the worker that set the pause may take it back. If another has since asked for
+            // longer, that one is about a refusal this crawler has not routed around, and it stands.
+            // The gap and the block count are untouched either way - the refusal really happened.
+            forgive(outcome){
+
+                if(!outcome||this.pausedUntil!==outcome.until) return;
+
+                this.pausedUntil=performance.now();
+                this.paidOut=Math.max(0,this.paidOut-outcome.cool);
 
             },
 
@@ -307,7 +331,14 @@ window.CrawlerCore = (function(){
             retryForbidden:true,
             // swapped out by crawlers that must route some URLs through the service worker
             request:null,
-            onRefused:null
+            onRefused:null,
+
+            // How many refused attempts before the ladder is abandoned in favour of whatever the
+            // caller falls back to, and a predicate saying whether it has one left to fall back
+            // to. Wired to `()=>tabs.available` by every crawler with a tab fallback; leave
+            // canEscalate null and the ladder always runs in full, as it did before.
+            escalateAfter:2,
+            canEscalate:null
         },options||{});
 
         const stats={
@@ -318,6 +349,11 @@ window.CrawlerCore = (function(){
             deadEnds:0,
             byReason:{}
         };
+
+        // The last answer each URL got. A tab fallback needs it to tell a REFUSAL - which a real
+        // navigation usually answers differently - from a 404, which it answers exactly the same
+        // way, only several seconds slower.
+        const answers=new Map();
 
         function note(reason){
 
@@ -425,6 +461,8 @@ window.CrawlerCore = (function(){
 
                 const status=response.status;
 
+                answers.set(url,status);
+
                 // the caller may want to inspect a refusal before we decide what it means
                 // (a sign-in redirect, a Cloudflare challenge, a country wall)
                 if(settings.inspect){
@@ -456,6 +494,28 @@ window.CrawlerCore = (function(){
                     }
 
                     if(outcome.dead) return null;
+
+                    // The caller has a better answer than the rest of this ladder - a real
+                    // navigation in a tab - and this refusal has already survived a retry. 403,
+                    // 429 and 503 are all statuses a site picks for a request that did not look
+                    // like a browser, and none of them are really about how fast we asked, so four
+                    // more fetches and forty seconds of cooling off buy nothing but delay.
+                    //
+                    // canEscalate is asked every time rather than once: the moment the fallback is
+                    // spent or unreachable the ladder becomes the only thing left, and it has to
+                    // run in full instead of being cut short in favour of a tab that never opens.
+                    if(o.canEscalate&&attempt>=o.escalateAfter&&o.canEscalate(url)){
+
+                        gate.forgive(outcome);
+
+                    if(note("handed to the tab fallback")){
+                            console.warn(o.log,`HTTP ${status} on attempt ${attempt} - handing `
+                                +"this one to the tab fallback instead of the rest of the ladder",url);
+                        }
+
+                        return null;
+
+                    }
 
                     continue;
 
@@ -552,7 +612,13 @@ window.CrawlerCore = (function(){
 
         }
 
-        return {fetchDoc,fetchDocCached,stats,describe,cache};
+        // undefined when nothing ever answered - a dropped connection, or a session the gate had
+        // already written off before the request went out
+        function lastStatus(url){
+            return answers.get(url);
+        }
+
+        return {fetchDoc,fetchDocCached,stats,describe,cache,lastStatus};
 
     }
 
@@ -872,6 +938,471 @@ window.CrawlerCore = (function(){
     }
 
     //---------------------------------------------------
+    // the tab fallback
+    //
+    // When a site answers a fetch() with 429/503/403/5xx it is often not saying "too fast" - it is
+    // saying "that did not look like a browser". A fetch from a content script carries no
+    // navigation behind it: no document, no Sec-Fetch-Mode: navigate, no chance to run the
+    // JavaScript a managed challenge asks for. Cloudflare and friends score it accordingly, and no
+    // amount of waiting changes the answer - which is why a run could sit out its whole cooldown
+    // budget and still come away with nothing.
+    //
+    // The same URL opened as a real top level navigation carries the entire browser with it, and
+    // normally comes straight back. So that is the fallback: hand the refused URL to tabs.js,
+    // which opens it, waits, lifts the HTML out and closes the tab again. If the challenge is one
+    // only a person can clear, the tab is brought to the front and the user clears it - once, for
+    // the whole site, after which the cheap path works again for the rest of the run.
+    //
+    // A content script cannot open tabs, which is the only reason the service worker exists.
+    //---------------------------------------------------
+
+    function makeTabFallback(options){
+
+        const o=Object.assign({
+
+            // How much of a refused run is worth rescuing this way. A tab load is a few seconds
+            // and they cannot run in parallel, so this is a time budget as much as a page budget.
+            budget:80,
+
+            // How many pages in a row must have needed a tab before the cheap path stops being
+            // tried first. Past that the retry ladder in front of every page is pure delay,
+            // because none of them come back.
+            preferAfter:3,
+
+            // ...and how many tab reads later the cheap path is re-tested, so a block that has
+            // since lifted is noticed instead of being paid for until the end of the run
+            recheck:10,
+
+            // How many times a run may take the window away from the person using it. A tab that
+            // steals focus is expensive to them, so this is deliberately small: one solved
+            // challenge sets a cookie for the whole site and the cheap path works again.
+            askLimit:2,
+
+            // told the outcome, so the caller can react (a sign-in wall is not a bot check)
+            inspect:null,
+
+            // a URL the caller knows a tab cannot help with
+            worthIt:null,
+
+            lastStatus:null,
+
+            // How many times a message to the service worker may go unanswered before it is
+            // treated as genuinely absent rather than merely asleep. See wake() below.
+            workerTries:3,
+            workerWake:250,
+
+            describe:url=>url,
+            report:()=>{},
+            log:"[crawler]"
+
+        },options||{});
+
+        // 404/410 mean the page is not there, and a tab renders the same "not found" more slowly.
+        // Only a refusal is worth reopening - that is the one a real navigation answers differently.
+        function refusal(status){
+            return status===429||status===503||status===403||status>=500;
+        }
+
+        // Ask the service worker, allowing for the fact that it may not be running.
+        //
+        // MV3 shuts a worker down whenever it goes idle, and the FIRST tab of a run comes after a
+        // long stretch of nothing but fetches - so it very often lands exactly in the window where
+        // the worker is booting and sendMessage rejects with "Could not establish connection.
+        // Receiving end does not exist." That is transient: the same message a moment later is
+        // delivered to the worker Chrome just started.
+        //
+        // This used to be one attempt whose rejection was marked `fatal`, which switched the whole
+        // fallback off for the rest of the run on a race that resolves itself in ~200ms. A run that
+        // could have rescued sixty pages rescued none, and said nothing about why.
+        async function wake(message){
+
+            let last="";
+
+            for(let attempt=1;attempt<=o.workerTries;attempt++){
+
+                try{
+
+                    const reply=await chrome.runtime.sendMessage(message);
+
+                    if(reply) return reply;
+
+                    last="the worker accepted the message but answered nothing";
+
+                }
+                catch(e){
+                    last=e&&e.message||String(e);
+                }
+
+                if(attempt<o.workerTries){
+
+                    console.warn(o.log,`the background worker did not answer `
+                        +`(${attempt}/${o.workerTries}) - ${last}`);
+
+                    await sleep(o.workerWake*attempt);
+
+                }
+
+            }
+
+            // it was given every chance and is genuinely not there
+            return {ok:false,error:last,fatal:true};
+
+        }
+
+        return {
+
+            used:0,
+            ok:0,
+            failed:0,
+            solved:0,
+            asked:0,
+            streak:0,
+
+            // "" while usable, otherwise why it stopped - the summary has to be able to say which
+            off:"",
+
+            // Latching it here rather than at the point of use is what makes the stop audible.
+            // The budget was previously only noticed inside get(), which worthIt() had already
+            // short-circuited past - so the fallback quietly went dormant and the summary went on
+            // reporting a tidy "3/3 rescued" while everything after that point was missing.
+            // Switching the fallback off is the moment a run quietly stops being able to recover,
+            // so it is never done silently. It used to be: `off` was set, one console.warn was
+            // written, and the next eighty refusals produced no output at all - which reads from
+            // the console exactly like the fallback was never wired up.
+            stop(reason){
+
+                if(this.off) return;
+
+                this.off=reason;
+
+                if(reason==="budget"){
+
+                    o.report(`Tab fallback used up its ${o.budget} page budget - anything refused `
+                        +"from here on will be missing from the file.");
+
+                    return;
+
+                }
+
+                o.report("The tab fallback cannot reach this extension's background worker, so "
+                    +"refused pages can no longer be reopened. Open chrome://extensions, reload "
+                    +"the extension, and run again.");
+
+            },
+
+            get available(){
+                return !this.off&&this.used<o.budget;
+            },
+
+            // every recent page has needed a tab, so try it first and skip the ladder
+            get preferred(){
+                return this.streak>=o.preferAfter;
+            },
+
+            // a cheap fetch came back: the block may have lifted
+            clean(){
+                this.streak=0;
+            },
+
+            worthIt(url){
+
+                if(this.off) return false;
+
+                if(this.used>=o.budget){
+
+                    this.stop("budget");
+
+                    return false;
+
+                }
+
+                if(o.worthIt&&!o.worthIt(url)) return false;
+
+                // A ternary, not `o.lastStatus&&o.lastStatus(url)`: that yields null rather than
+                // undefined when no lookup was supplied, which failed the "nothing ever answered"
+                // test below and quietly refused to open a tab for anyone who did not pass one.
+                const status=o.lastStatus?o.lastStatus(url):undefined;
+
+                // no status at all means nothing ever answered - a dropped connection, or a
+                // session the gate had already written off. Both are worth a real navigation.
+                return status===undefined||refusal(status);
+
+            },
+
+            // Called once before a crawl starts. Two jobs: wake the worker, so the first real
+            // refusal is not also a cold start, and say early - rather than after twenty refused
+            // pages - if there is no worker to wake.
+            //
+            // A failed ping deliberately does NOT switch the fallback off. This is a diagnostic,
+            // not a verdict: an older worker may not answer "tab:ping" at all, and a ping can lose
+            // the same start-up race a fetch would have survived. The fallback is only given up on
+            // when a real page request has exhausted its retries, in get() below.
+            async ready(){
+
+                if(this.off) return false;
+
+                const reply=await wake({type:"tab:ping"});
+
+                if(reply&&reply.ok) return true;
+
+                o.report("Could not reach this extension's background worker, so refused pages may "
+                    +"not be reopenable. If that happens, open chrome://extensions, reload the "
+                    +"extension, and run again.");
+
+                return false;
+
+            },
+
+            async get(url){
+
+                if(this.off) return null;
+
+                if(this.used>=o.budget){
+
+                    this.stop("budget");
+
+                    return null;
+
+                }
+
+                this.used++;
+
+                // Only interrupt the person when the automatic path has nothing left to try, and
+                // only a couple of times a run.
+                //
+                // The quota is CLAIMED here, before the await, not counted from the replies. Every
+                // crawler runs this from a pool, so with parallel=6 all six workers reached a
+                // refusal in the same tick, all six read `asked` as 0, and all six were told they
+                // could ask - turning askLimit:2 into six tabs taking the window in turn. Reading
+                // a limit before an await and updating it after is only ever right at parallel=1.
+                const letUserSolve=this.asked<o.askLimit;
+
+                if(letUserSolve) this.asked++;
+
+                o.report(`Refused - reopening ${o.describe(url)} in a tab (${this.used}/${o.budget})`);
+
+                const reply=await wake({type:"tab:fetch",url,letUserSolve});
+
+                // the page loaded without needing anyone, so hand the claim back rather than
+                // spending a run's whole interruption budget on tabs that never interrupted
+                if(letUserSolve&&!(reply&&reply.askedUser)) this.asked--;
+
+                if(!reply||!reply.ok){
+
+                    this.failed++;
+
+                    console.warn(o.log,"tab fallback failed:",reply&&reply.error||"no reply from the worker");
+
+                    // no worker, or tabs cannot be opened at all: every later attempt fails the
+                    // same way, and each one costs a wasted round trip
+                    if(!reply||reply.fatal) this.stop("broken");
+
+                    else if(reply.challenged&&reply.askedUser){
+
+                        o.report("The check in the tab was not cleared, so the pages behind it "
+                            +"cannot be read. Open the site in a normal tab, clear it by hand, "
+                            +"then run again.");
+
+                    }
+
+                    return null;
+
+                }
+
+                this.ok++;
+                this.streak++;
+
+                if(reply.solvedByUser){
+
+                    this.solved++;
+
+                    // the cookie that check just set covers the whole site, so the cheap path is
+                    // worth trying again immediately rather than after another `recheck` tabs
+                    this.streak=0;
+
+                    o.report("Thanks - that check is cleared for the whole site, carrying on.");
+
+                }
+
+                // re-test the cheap path now and then: whatever was refusing fetches may have
+                // stopped, and a fetch is an order of magnitude cheaper than a tab load
+                if(this.streak>=o.preferAfter+o.recheck) this.streak=0;
+
+                return reply;
+
+            },
+
+            // the same thing, parsed, so callers can drop it straight in where a fetch went
+            async fetchDoc(url){
+
+                if(!this.worthIt(url)) return null;
+
+                const reply=await this.get(url);
+
+                if(!reply) return null;
+
+                if(o.inspect&&o.inspect(reply,url)==="stop") return null;
+
+                return new DOMParser().parseFromString(reply.html,"text/html");
+
+            },
+
+            describe(){
+
+                if(!this.used&&!this.off) return "";
+
+                return `Tabs: ${this.ok}/${this.used} page(s) rescued by reopening them`
+                    +(this.solved?`, ${this.solved} after you cleared a check`:"")
+                    +(this.failed?`, ${this.failed} failed`:"")
+                    +(this.off==="budget"?" - budget spent":"")
+                    +(this.off==="broken"?" - the tab worker never answered":"");
+
+            }
+
+        };
+
+    }
+
+    // Read a page the cheap way, and only if that is refused, the way a person would.
+    async function tabFirst(fetcher,tabs,url,opts){
+
+        // Every recent page has needed a tab, so the ladder in front of this one would only be
+        // delay. The gate is not consulted here: once it writes the session off, fetchDoc returns
+        // immediately, which is already the fast path we want.
+        if(tabs.preferred){
+
+            const early=await tabs.fetchDoc(url);
+
+            if(early) return early;
+
+        }
+
+        const doc=await fetcher.fetchDoc(url,opts);
+
+        if(doc){
+
+            tabs.clean();
+
+            return doc;
+
+        }
+
+        // refused, dead connection, or the gate gave up on fetches altogether. A real navigation
+        // is a different proposition entirely.
+        return tabs.fetchDoc(url);
+
+    }
+
+    //---------------------------------------------------
+    // the headcount, and how much it is worth
+    //
+    // "51 to 200 employees" sitting next to a field labelled "Company size" is a fact. The same
+    // string found by running the same regex over the whole <body> is a guess - "join our team of
+    // 200 employees" in an advert reads identically, and it lands in the file looking just as
+    // authoritative as the real thing. That is worse than an empty cell, because nothing
+    // downstream can tell the two apart, and it was happening on five of the seven crawlers.
+    //
+    // So the search runs in two bounded steps and never over the whole document:
+    //   "label" - a text block that IS a size label, with the value in the very next block
+    //   "near"  - a leaf element whose text is MOSTLY the value ("501-1000 Employees" on its own)
+    // and it reports which of the two answered, so the summary can say how much of the column is
+    // fact and how much is inference.
+    //
+    // There is deliberately no third step. A whole-body scan is the thing this replaces.
+    //---------------------------------------------------
+
+    const SIZE_SCOPE="li,tr,td,dd,dt,p,span,div,section,article";
+
+    function headcount(root,options){
+
+        const o=Object.assign({
+            // anchored: matched against one whole text block, e.g. /^(?:company size|size)$/i
+            label:null,
+            // the value itself, e.g. /\d[\d.,]*\s*(?:to|-)\s*\d[\d.,]*\s*employees?/i
+            value:null,
+            scope:SIZE_SCOPE,
+            // an element longer than this is a section, not a field
+            maxLen:160
+        },options||{});
+
+        if(!root||!o.value) return {text:"",source:""};
+
+        const elements=root.querySelectorAll(o.scope);
+
+        // 1. label + the next text block. Nothing else can produce that pairing, so it is taken
+        //    at face value - including values the regex below would not recognise.
+        if(o.label){
+
+            for(const el of elements){
+
+                const parts=blocks(el);
+
+                // a container wrapping half the page pairs a label with whatever text happens to
+                // follow it several sections later
+                if(parts.length>12) continue;
+
+                for(let i=0;i+1<parts.length;i++){
+
+                    if(o.label.test(parts[i])&&parts[i+1]){
+                        return {text:parts[i+1].replace(/\s+/g," ").trim(),source:"label"};
+                    }
+
+                }
+
+            }
+
+        }
+
+        // 2. a leaf element that is mostly the value. The half-length rule is what separates
+        //    "501-1000 Employees" in its own span from "Join our team of 200 employees" in an
+        //    advert: the first IS the field, the second only mentions a number.
+        for(const el of elements){
+
+            if(el.querySelector(o.scope)) continue;
+
+            const text=blocks(el).join(" ");
+
+            if(!text||text.length>o.maxLen) continue;
+
+            const match=text.match(o.value);
+
+            if(match&&match[0].length*2>=text.length){
+                return {text:match[0].replace(/\s+/g," ").trim(),source:"near"};
+            }
+
+        }
+
+        return {text:"",source:""};
+
+    }
+
+    // One line for the summary, over rows carrying an `employeesSource`. Without it the column is
+    // a number with no provenance and no way to audit it; with it a run says out loud how much of
+    // the column is a labelled field and how much is inference.
+    function describeSizes(rows){
+
+        let label=0;
+        let near=0;
+        let blank=0;
+
+        for(const row of rows||[]){
+
+            const source=row&&row.employeesSource;
+
+            if(source==="label") label++;
+            else if(source==="near") near++;
+            else blank++;
+
+        }
+
+        if(!label&&!near) return "";
+
+        return `Employees: ${label+near} read (${label} from a labelled field, `
+            +`${near} from an unlabelled element), ${blank} blank`;
+
+    }
+
+    //---------------------------------------------------
     // the checkpoint
     //
     // A content script dies instantly when the tab navigates - no catch block runs, no file is
@@ -1076,6 +1607,10 @@ window.CrawlerCore = (function(){
         bumpParam,
         paramOf,
         nameKey,
+        makeTabFallback,
+        tabFirst,
+        headcount,
+        describeSizes,
         makeCheckpoint,
         exportXlsx,
         makeReporter

@@ -53,8 +53,26 @@
     const PUBLISHED=/^(?:published|online seit|veröffentlicht)\s*:?\s*/i;
 
     // <a aria-label="Next" href="...&page=2">
-    const NEXT='nav[aria-label="pagination"] a[aria-label="Next"]';
-    const NEXT_FALLBACK='nav[aria-label="pagination"] a[aria-label*="next" i]';
+    //
+    // aria-label="Next" only exists on the English site and www.stepstone.de serves German by
+    // default, so the one selector the entire walk depended on matched nothing: the run ended
+    // after the open page and reported itself as complete. Tried in order of how much each can
+    // be trusted - rel="next" is the standard and language independent, data-at is what the rest
+    // of this file relies on, aria-label comes last. Every candidate is checked against the
+    // CURRENT page number before it is used (see nextUrl), so a loose selector here cannot send
+    // the walk sideways or backwards.
+    const NEXT_LINKS=[
+        'a[rel~="next"]',
+        'a[data-at*="next" i]',
+        'a[data-testid*="next" i]',
+        'nav[aria-label="pagination"] a[aria-label="Next"]',
+        'a[aria-label*="next" i]',
+        'a[aria-label*="nächste" i]',
+        'a[aria-label*="naechste" i]'
+    ];
+
+    // StepStone puts 25 ads on a page; only used to stop counting past the end of the list
+    const PAGE_SIZE=25;
 
     // total job count: prefer the clean attribute, fall back to the "4.061" heading
     const TOTAL_ATTR="[data-resultlist-offers-total]";
@@ -84,16 +102,35 @@
     // refused, which is the only time that wait buys anything.
     const gate=core.makeGate({minGap:0,limit:4,log:LOG});
 
-    const fetcher=core.makeFetcher(gate,{log:LOG});
-
-    const fetchDoc=fetcher.fetchDoc;
+    const fetcher=core.makeFetcher(gate,{
+        log:LOG,
+        // Two refusals in a row are answered by a real navigation, not by the rest of the
+        // ladder - but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available
+    });
 
     const jobs=[];
-    const visited=new Set();
+    // job id -> the results page it was found on. A plain Set of ids was enough to dedupe, but
+    // not to tell the two reasons a page can bring nothing new apart: a page re-read on purpose
+    // (the rewind, a resumed run) versus StepStone answering a page number past the end of the
+    // list by re-serving page 1. The first must not stop the walk; the second must.
+    const visited=new Map();
 
     const startedAt=performance.now();
 
     const report=core.makeReporter("stepstone-crawler-status",LOG);
+
+    // A 429/403/5xx is often "that did not look like a browser" rather than "too fast", and no
+    // amount of backing off answers it. Reopening the URL as a real navigation does, and if the
+    // check needs a person the tab is put in front of them - once, for the whole site.
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report,
+        lastStatus:fetcher.lastStatus,
+        describe:url=>"page "+(core.paramOf(url,"page",ORIGIN)||1)
+    });
+
+    const fetchDoc=(url,opts)=>core.tabFirst(fetcher,tabs,url,opts);
 
     const norm=core.norm;
     const pick=core.pick;
@@ -132,18 +169,16 @@
         let maxPages=0;
         let concurrency=4;
         let wantDetails=true;
-        let everyJob=false;
 
         try{
 
-            const settings=await chrome.storage.local.get(["maxPages","concurrency","details","everyJob"]);
+            const settings=await chrome.storage.local.get(["maxPages","concurrency","details"]);
 
             maxPages=Math.max(0,+settings.maxPages||0);
 
             if(settings.concurrency) concurrency=Math.min(12,Math.max(1,+settings.concurrency));
 
             if(settings.details===false) wantDetails=false;
-            if(settings.everyJob===true) everyJob=true;
 
         }
         catch(e){
@@ -166,7 +201,7 @@
 
                 if(!job||!job.id||visited.has(job.id)) continue;
 
-                visited.add(job.id);
+                visited.set(job.id,job.page||0);
                 jobs.push(job);
                 resumed++;
 
@@ -184,7 +219,7 @@
 
         if(total) console.log(LOG,`${total} jobs match the current filters`);
 
-        const paging=await crawlAllPages(maxPages);
+        const paging=await crawlAllPages(maxPages,total);
 
         console.log(LOG,`${paging.pages} page(s) read -> ${jobs.length} jobs`
             +(paging.stoppedEarly?" (stopped early)":""));
@@ -206,14 +241,14 @@
 
         //---------------------------------------------------
         // 4. Employees / work type are not on the card -> open the job's detail page.
-        //    By default one page per company (the newest listing); with "every job" on,
-        //    every listing is opened: slower, but it collects each listing's location.
+        //    One page per company (its newest listing) - opening every listing instead would
+        //    multiply the request count by the jobs-per-company ratio to add nothing but the
+        //    other branches' locations, and that is where StepStone starts returning 429.
         //---------------------------------------------------
 
         const byKey=new Map(companies.map(company=>[company.key,company]));
 
         const targets=!wantDetails?[]
-            :everyJob?jobs.filter(job=>job.jobUrl).map(job=>({url:job.jobUrl,key:job.key}))
             :companies.filter(company=>company.jobUrl).map(company=>({url:company.jobUrl,key:company.key}));
 
         let failed=0;
@@ -306,10 +341,14 @@
 
         fileWritten=true;
 
-        // fixed header: companies with missing data must still keep all 6 columns
-        const HEADERS=["Company Name","Location","Positions","Recruitment time","Employees","Remote/Onsite"];
+        // fixed header: companies with missing data must still keep all 7 columns.
+        // "No." is written because the rows are in StepStone's own order - without a number
+        // there is nothing in the file to check that order against, or to point at when a row
+        // is missing.
+        const HEADERS=["No.","Company Name","Location","Positions","Recruitment time","Employees","Remote/Onsite"];
 
-        const results=state.companies.map(company=>({
+        const results=state.companies.map((company,index)=>({
+            "No.":index+1,
             "Company Name":company.name,
             "Location":company.locations.join(", "),
             "Positions":company.positions.join(" | "),
@@ -320,7 +359,7 @@
 
         const written=core.exportXlsx(results,{
             headers:HEADERS,
-            widths:[34,30,60,16,18,16],
+            widths:[6,34,30,60,16,18,16],
             filename:"stepstone_companies.xlsx",
             log:LOG
         });
@@ -328,7 +367,7 @@
         const withTime=results.filter(r=>r["Recruitment time"]).length;
         const elapsed=Math.round((performance.now()-startedAt)/1000);
 
-        const paging=state.paging||{pages:0,failed:0,recovered:0,reason:"end"};
+        const paging=state.paging||{pages:0,failed:0,recovered:0,counted:0,reason:"end"};
 
         // "Done" on its own reads as "that was all of it", which is exactly wrong when StepStone
         // cut the walk short - the file then looks complete while half the list is missing.
@@ -336,6 +375,10 @@
             rewound?`Rewound to page 1: the tab was on page ${rewound+1}, so pages 1-${rewound} `
                 +"would otherwise have been skipped entirely.":"",
             paging.recovered?`${paging.recovered} page(s) were recovered on the second pass.`:"",
+            paging.counted?`StepStone's "Next" link could not be found on ${paging.counted} page(s), so `
+                +"the crawler counted ?page= forward instead. That is the intended fallback and "
+                +"nothing is missing because of it - but if the count above is short, this is the "
+                +"first thing to check.":"",
             paging.failed?`${paging.failed} page(s) could not be read at all - those jobs are missing.`:"",
             paging.reason==="blocked"
                 ? "StepStone stopped serving results part way through - this is a rate limit, not the "
@@ -353,8 +396,10 @@
                 :", job details off")
             +`, ${state.failed} request errors.`
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
+            +(core.describeSizes(state.companies)?`\n${core.describeSizes(state.companies)}`:"")
             +(problems.length?"\n\n"+problems.join("\n"):"")
             +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")
+            +(tabs.describe()?`\n${tabs.describe()}`:"")
             +(state.crashed?`\n\nThe run stopped early: ${state.crashed}.`
                 +"\nEverything collected before that point is in the file above.":"");
 
@@ -406,26 +451,77 @@
     // helper: read the current page's list fully BEFORE moving on
     // The "Next" button is a real <a>: clicking it reloads the page and kills the content
     // script, so the crawler follows its href with fetch instead.
-    // Stops when: there is no Next left, the next page has no cards, Next points back to a
-    // page already read, or the max pages limit is reached.
+    // Stops when: a page comes back with no cards, a page reached by counting repeats one
+    // already read, pagination points back at a page already read, or the max pages limit is
+    // reached. Note what is NOT on that list any more - "the Next link could not be found".
+    // That is a fact about one CSS selector, not about the list, and treating it as the end of
+    // the results is what truncated a 4,000 job search to the 25 ads on screen.
     //---------------------------------------------------
 
-    async function crawlAllPages(maxPages){
+    async function crawlAllPages(maxPages,total){
 
         const limit=maxPages?Math.min(maxPages,HARD_PAGE_CAP):HARD_PAGE_CAP;
 
+        const here=core.paramOf(location.href,"page",ORIGIN)||1;
+
         // the open page is already rendered and costs no request, so read it whatever happens
-        const first=collectFrom(document);
+        const first=collectFrom(document,here);
 
         report(`Open page: +${first.added} job(s), ${jobs.length} total`);
 
-        const here=core.paramOf(location.href,"page",ORIGIN)||1;
+        // the last page that can hold anything, so counting forward stops at the end of the list
+        // instead of walking to the cap. 0 when the total could not be read.
+        const lastPage=total?Math.ceil(total/PAGE_SIZE):0;
+
+        // URLs the crawler counted its way to rather than read off a link. Kept apart because a
+        // counted page that brings nothing new is StepStone re-serving an earlier page, which is
+        // how it answers a page number past the end - and that has to end the walk.
+        const counted=new Set();
+
+        let lastPageHadCards=first.cards>0;
+
+        // The same search one page further on. Deliberately NOT core.bumpParam: that reads a
+        // missing ?page= as 0, so it steps from the first page (which carries no page param at
+        // all) to "page=1" - the same page again, which the loop guard then reads as pagination
+        // going in a circle.
+        function stepPage(url){
+
+            try{
+
+                const next=new URL(url,ORIGIN);
+
+                next.searchParams.set("page",String((core.paramOf(url,"page",ORIGIN)||1)+1));
+
+                const clean=cleanUrl(next.toString());
+
+                counted.add(clean);
+
+                return clean;
+
+            }
+            catch(e){
+                return "";
+            }
+
+        }
+
+        // can the walk step forward from `page` at all, or is that already the end of the list
+        function moreAfter(page){
+            return lastPageHadCards&&(!lastPage||page<lastPage);
+        }
 
         // The Next chain only ever goes FORWARD, so starting wherever the tab happens to sit
         // silently drops every earlier page - a tab left on page 5 lost 100 jobs and the summary
         // said nothing about them. Rewind to page 1 instead; the pages already in `visited` are
         // deduped on arrival, so the only cost is the requests, not the data.
-        const start=here>1?pageUrl(1):nextUrl(document);
+        //
+        // The open page's own Next link is the preferred first hop, but when it cannot be found
+        // the walk did not merely stop early - it never started. walkPages ends before its first
+        // iteration on an empty `first`, so the run exported the 25 ads already on screen and
+        // reported reason "end", i.e. "that was the whole list". Counting forward is the floor
+        // under that, exactly as it is for every later hop.
+        const start=here>1?pageUrl(1)
+            :nextUrl(document,location.href)||(moreAfter(here)?stepPage(location.href):"");
 
         rewound=here>1?here-1:0;
 
@@ -437,16 +533,31 @@
 
             fetchDoc:(url,opts)=>fetchDoc(url,opts),
 
-            onDoc:async (doc,url,page)=>{
+            onDoc:async (doc,url)=>{
 
-                const found=collectFrom(doc);
+                const page=core.paramOf(url,"page",ORIGIN)||1;
+
+                const found=collectFrom(doc,page);
+
+                lastPageHadCards=found.cards>0;
 
                 report(`Page ${page}: +${found.added} job(s), ${jobs.length} total`);
 
                 await checkpoint.save({jobs});
 
-                if(doc.querySelectorAll(CARD).length===0){
+                if(found.cards===0){
                     console.warn(LOG,"a page had no job cards - end of the list or a bot check");
+                    return "stop";
+                }
+
+                // A counted page that brought nothing new AND is made of ads belonging to other
+                // pages is StepStone answering a page number past the end by re-serving an
+                // earlier page. "Nothing new" on its own is not enough: the rewind re-reads the
+                // tab's own page on purpose, and so does a resumed run - both add nothing and
+                // both must carry on.
+                if(found.added===0&&found.elsewhere>0&&counted.has(url)){
+                    console.warn(LOG,`page ${page} was reached by counting and came back holding`
+                        +" ads from a page already read - that is the end of the list");
                     return "stop";
                 }
 
@@ -454,13 +565,31 @@
 
             },
 
-            nextOf:doc=>nextUrl(doc),
+            // The Next link is the better source - it is what the site itself says comes next.
+            // But it is one selector against markup that is renamed per build AND per language,
+            // and when it missed, "there is no next page" and "we could not find the next page"
+            // were the same answer: the walk ended after one page and the run called itself
+            // complete. Counting forward is the floor under that - StepStone's pagination is a
+            // plain ?page= counter, and the first page with no cards ends the walk.
+            nextOf:(doc,url)=>{
+
+                const found=nextUrl(doc,url);
+
+                if(found) return found;
+
+                const page=core.paramOf(url,"page",ORIGIN)||1;
+
+                if(!moreAfter(page)) return "";
+
+                console.warn(LOG,`no "Next" link on page ${page} - counting forward instead`);
+
+                return stepPage(url);
+
+            },
 
             // The next URL normally comes out of the page we just failed to read, so without this
-            // one bad moment at page 27 of 60 threw away two thirds of the list. StepStone's
-            // pagination is a plain ?page= counter, so the page after a missing one is knowable
-            // without it.
-            guessNext:url=>cleanUrl(core.bumpParam(url,"page",1,ORIGIN)),
+            // one bad moment at page 27 of 60 threw away two thirds of the list.
+            guessNext:url=>stepPage(url),
 
             maxPages:limit,
             report,
@@ -471,9 +600,12 @@
         await checkpoint.save({jobs},true);
 
         return {
-            pages:walk.pages+1,
+            // walkPages starts its counter at 1 for the page already on screen, so it is already
+            // the total number of pages read - adding another one over-reported every run by 1
+            pages:walk.pages,
             failed:walk.skipped,
             recovered:walk.recovered,
+            counted:counted.size,
             reason:walk.reason,
             stoppedEarly:walk.reason!=="end"
         };
@@ -495,41 +627,106 @@
     // helper: collect the jobs of one page
     //---------------------------------------------------
 
-    function collectFrom(doc){
+    // `page` and `rank` are the ad's position in the StepStone results, and they are the only
+    // record of it: the crawler does NOT read the pages in site order (it reads the open page
+    // first, then rewinds to page 1), so the order of `jobs` is the order it fetched them.
+    // buildCompanies sorts on these to put the sheet back into the order the site shows.
+    function collectFrom(doc,page){
 
         const cards=doc.querySelectorAll(CARD);
 
         let added=0;
+        let dropped=0;
+        let elsewhere=0;
+        let rank=0;
 
         cards.forEach(card=>{
 
-            // id="job-item-13961958"
-            const id=(card.getAttribute("id")||"").replace(/^job-item-/,"");
+            const job=readCard(card,page,rank++);
 
-            if(!id||visited.has(id)) return;
+            if(!job.id){
+                dropped++;
+                return;
+            }
 
-            visited.add(id);
+            if(visited.has(job.id)){
 
-            jobs.push(readCard(card,id));
+                // This ad was read as part of a DIFFERENT page, so this page is a copy of one
+                // already seen rather than a page being re-read on purpose. An unknown page (an
+                // old checkpoint) counts as the same page: erring towards carrying on costs one
+                // wasted request, erring the other way costs the rest of the list.
+                const from=visited.get(job.id);
+
+                if(from&&from!==page) elsewhere++;
+
+                return;
+
+            }
+
+            visited.set(job.id,page);
+
+            jobs.push(job);
 
             added++;
 
         });
 
-        return {cards:cards.length,added};
+        // a card with no identity used to be skipped in silence, so a build that renamed the id
+        // attribute emptied every page while the run still reported "+0 job(s)" and carried on
+        if(dropped){
+            console.warn(LOG,`${dropped} of ${cards.length} card(s) on page ${page} had neither an`
+                +" id nor a link and were skipped");
+        }
+
+        return {cards:cards.length,added,dropped,elsewhere};
 
     }
 
-    function readCard(card,id){
+    // getAttribute("href") is null on an element that is not a link, and new URL(null,ORIGIN)
+    // resolves to ".../null" - a job URL that looks real and 404s on every detail fetch.
+    function linkHref(el){
+
+        const href=el&&el.getAttribute&&el.getAttribute("href");
+
+        if(!href) return "";
+
+        try{
+            return cleanUrl(new URL(href,ORIGIN).toString());
+        }
+        catch(e){
+            return "";
+        }
+
+    }
+
+    // the title element is the link on today's markup, but it has been a heading inside one
+    function jobLink(card,title){
+
+        if(!title) return linkHref(card.querySelector("a[href]"));
+
+        return linkHref(title)
+            ||linkHref(title.querySelector&&title.querySelector("a[href]"))
+            ||linkHref(title.closest&&title.closest("a[href]"))
+            ||linkHref(card.querySelector("a[href]"));
+
+    }
+
+    function readCard(card,page,rank){
 
         const logo=card.querySelector(LOGO_LINK);
         const title=card.querySelector(TITLE);
         const posted=readPosted(card);
 
-        const companyUrl=logo?cleanUrl(new URL(logo.getAttribute("href"),ORIGIN).toString()):"";
+        const companyUrl=linkHref(logo);
+        const jobUrl=jobLink(card,title);
 
         return {
-            id,
+            // id="job-item-13961958". StepStone hashes and renames attributes per build, so fall
+            // back to the ad's own URL rather than dropping the card: either one is unique per ad
+            // and that is all `visited` needs.
+            id:(card.getAttribute("id")||"").replace(/^job-item-/,"")||jobUrl,
+            page,
+            rank,
             title:norm(title),
             company:pick(card,COMPANY),
             location:pick(card,LOCATION),
@@ -538,7 +735,7 @@
             postedAt:posted.at,
             companyUrl,
             employerId:employerId(companyUrl),
-            jobUrl:title?cleanUrl(new URL(title.getAttribute("href"),ORIGIN).toString()):""
+            jobUrl
         };
 
     }
@@ -579,12 +776,22 @@
 
         const map=new Map();
 
-        for(const job of list){
+        // Site order, not the order the crawler happened to fetch in. Those are not the same:
+        // when the tab sits on page 5 the open page is read FIRST and the walk then rewinds to
+        // page 1, so page 5's companies came out at the top of the sheet and page 5's ads at the
+        // front of every Positions cell. Resuming a checkpoint scrambled it further. (page,rank)
+        // is where the ad actually sits in the results, so sorting on it puts both the rows and
+        // the cells back into the order StepStone shows.
+        const ordered=[...list].sort((a,b)=>(a.page||0)-(b.page||0)||(a.rank||0)-(b.rank||0));
+
+        for(const job of ordered){
 
             const name=job.company||"(unknown)";
 
-            // group by company id; without an id, fall back to the normalized name
-            const key=job.employerId?"id:"+job.employerId:"name:"+name.toLowerCase();
+            // group by company id; without an id, fall back to the folded name rather than the
+            // lowercased one, so "N26 GmbH" and "N26 GmbH." do not become two rows each holding
+            // a slice of the positions
+            const key=job.employerId?"id:"+job.employerId:"name:"+core.nameKey(name);
 
             job.key=key;
 
@@ -596,6 +803,8 @@
                     key,
                     name,
                     employerId:job.employerId,
+                    // rank of this company's FIRST ad in the results - the sheet's "No." column
+                    seq:map.size,
                     jobs:0,
                     locations:[],
                     positions:[],
@@ -604,7 +813,9 @@
                     postedAt:0,
                     companyUrl:job.companyUrl,
                     jobUrl:job.jobUrl,
-                    employees:""
+                    employees:"",
+                    // "label" | "near" | "" - see core.headcount
+                    employeesSource:""
                 };
 
                 map.set(key,company);
@@ -629,8 +840,11 @@
 
         }
 
-        // most listings first, then alphabetically on a tie
-        return [...map.values()].sort((a,b)=>b.jobs-a.jobs||a.name.localeCompare(b.name));
+        // First appearance in the search results, so row 1 of the sheet is the first hit on
+        // page 1 and the "No." column can be read straight against the site. Ranking by ad count
+        // instead put a company from page 40 above the first hit on page 1, which made the file
+        // impossible to check against StepStone and hid the fact that whole pages were missing.
+        return [...map.values()].sort((a,b)=>a.seq-b.seq);
 
     }
 
@@ -688,12 +902,15 @@
         const cmp=doc.querySelector(DETAIL_CMP);
         const companyUrl=cmp?cleanUrl(new URL(cmp.getAttribute("href"),ORIGIN).toString()):"";
 
+        const size=readSize(doc);
+
         return {
             company:pick(doc,DETAIL_COMPANY),
             location:pick(doc,DETAIL_LOCATION),
             workType:pick(doc,DETAIL_WORK_TYPE),
             posted:pick(doc,DETAIL_DATE).replace(PUBLISHED,""),
-            employees:readSize(doc),
+            employees:size.text,
+            employeesSource:size.source,
             companyUrl,
             employerId:employerId(companyUrl)
         };
@@ -703,7 +920,10 @@
     // merge the detail page data into the company without overwriting what is already there
     function applyDetail(company,detail){
 
-        if(!company.employees&&detail.employees) company.employees=detail.employees;
+        if(!company.employees&&detail.employees){
+            company.employees=detail.employees;
+            company.employeesSource=detail.employeesSource;
+        }
 
         push(company.locations,detail.location);
         push(company.modes,readMode(detail.workType,detail.location));
@@ -730,28 +950,21 @@
             // textContent would run together into "Mitarbeiter2" and the regex would swallow the 2.
             const match=blocks(card).join(" ").match(SIZE_TEXT);
 
-            if(match) return match[0].trim();
+            // the company card is a dedicated block, so a match inside it is the field itself
+            if(match) return {text:match[0].trim(),source:"label"};
 
         }
 
-        // blocks with an explicit label: "Mitarbeiter" + "1.001-5.000"
-        for(const el of doc.querySelectorAll("[data-at],[data-testid],li,dd,dt")){
-
-            const parts=blocks(el);
-
-            for(let i=0;i+1<parts.length;i++){
-
-                if(SIZE_LABEL.test(parts[i])&&parts[i+1]) return parts[i+1];
-
-            }
-
-        }
-
-        const text=norm(doc.body);
-
-        const found=text.match(SIZE_RANGE)||text.match(SIZE_OPEN)||text.match(SIZE_TEXT);
-
-        return found?found[0].trim():"";
+        // A label with the value in the next block ("Mitarbeiter" + "1.001-5.000"), then a small
+        // element that IS the value. What is NOT done any more is running the same regexes over
+        // norm(doc.body): a German advert saying "unser Team von 25 Mitarbeitern" matched
+        // SIZE_TEXT and became the company's headcount, in a cell indistinguishable from a real
+        // one. An empty cell is recoverable; a plausible wrong number is not.
+        return core.headcount(doc,{
+            label:SIZE_LABEL,
+            value:new RegExp(SIZE_RANGE.source+"|"+SIZE_OPEN.source+"|"+SIZE_TEXT.source,"i"),
+            scope:"[data-at],[data-testid],li,dd,dt,td,p,span,div"
+        });
 
     }
 
@@ -759,13 +972,39 @@
     // helper: URL of the next page
     //---------------------------------------------------
 
-    function nextUrl(doc){
+    // `from` is the URL this document was fetched from. A "next" link has to actually move
+    // FORWARD, and checking that is what makes the deliberately loose selector list safe: a
+    // "Weitere Infos" link, a rel="next" on something that is not pagination, or a language
+    // variant that happens to match all fail the same test and are ignored rather than sending
+    // the walk sideways or into a circle.
+    function nextUrl(doc,from){
 
-        const link=doc.querySelector(NEXT)||doc.querySelector(NEXT_FALLBACK);
+        const here=core.paramOf(from||location.href,"page",ORIGIN)||1;
 
-        const href=link&&link.getAttribute("href");
+        for(const selector of NEXT_LINKS){
 
-        return href?cleanUrl(new URL(href,ORIGIN).toString()):"";
+            for(const link of doc.querySelectorAll(selector)){
+
+                const href=link.getAttribute("href");
+
+                if(!href) continue;
+
+                let candidate;
+
+                try{
+                    candidate=cleanUrl(new URL(href,ORIGIN).toString());
+                }
+                catch(e){
+                    continue;
+                }
+
+                if((core.paramOf(candidate,"page",ORIGIN)||1)>here) return candidate;
+
+            }
+
+        }
+
+        return "";
 
     }
 

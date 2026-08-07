@@ -2,7 +2,6 @@ const button = document.getElementById("crawl");
 const status = document.getElementById("status");
 const maxPages = document.getElementById("maxPages");
 const details = document.getElementById("details");
-const everyJob = document.getElementById("everyJob");
 const concurrency = document.getElementById("concurrency");
 
 // content.js clamps this too; here it only keeps the input from accepting absurd numbers
@@ -14,13 +13,9 @@ async function save() {
 
     concurrency.value = parallelValue();
 
-    // "every job" only means anything while detail pages are being opened
-    everyJob.disabled = !details.checked;
-
     await chrome.storage.local.set({
         maxPages: Math.max(0, parseInt(maxPages.value, 10) || 0),
         details: details.checked,
-        everyJob: details.checked && everyJob.checked,
         concurrency: parallelValue()
     });
 
@@ -28,18 +23,14 @@ async function save() {
 
 async function init() {
 
-    const settings = await chrome.storage.local.get(["maxPages", "details", "everyJob", "concurrency"]);
+    const settings = await chrome.storage.local.get(["maxPages", "details", "concurrency"]);
 
     if (settings.maxPages) maxPages.value = settings.maxPages;
     if (settings.details === false) details.checked = false;
-    if (settings.everyJob === true) everyJob.checked = true;
     if (settings.concurrency) concurrency.value = settings.concurrency;
-
-    everyJob.disabled = !details.checked;
 
     maxPages.addEventListener("change", save);
     details.addEventListener("change", save);
-    everyJob.addEventListener("change", save);
     concurrency.addEventListener("change", save);
 
 }

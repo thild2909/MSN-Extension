@@ -53,6 +53,10 @@
     // "1,001-5,000 employees" on the company profile
     const SIZE_DOC=/([\d,]+\s*(?:[-–—]|to)\s*[\d,]+|[\d,]+\s*\+|[\d,]+)\s*employees/i;
 
+    // the field label, when the profile renders one - a value read next to this is a fact rather
+    // than a number that happened to sit next to the word "employees"
+    const SIZE_LABEL=/^(?:company size|size|employees|number of employees)$/i;
+
     const jobs=[];
 
     // dedupe by job id: one listing can appear twice (sponsored + organic)
@@ -67,9 +71,24 @@
     // anything is actually refused.
     const gate=core.makeGate({minGap:0,limit:6,log:LOG});
 
-    const fetcher=core.makeFetcher(gate,{log:LOG});
+    const fetcher=core.makeFetcher(gate,{
+        log:LOG,
+        // Two refusals in a row are answered by a real navigation, not by the rest of the
+        // ladder - but only while there is a tab left to open. See core.makeFetcher.
+        canEscalate:()=>tabs.available
+    });
 
-    const fetchDoc=fetcher.fetchDoc;
+    // A 429/403/5xx is often "that did not look like a browser" rather than "too fast", and no
+    // amount of backing off answers it. Reopening the URL as a real navigation does, and if the
+    // check needs a person the tab is put in front of them - once, for the whole site.
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report,
+        lastStatus:fetcher.lastStatus,
+        describe:url=>"page "+(core.paramOf(url,"page",ORIGIN)||1)
+    });
+
+    const fetchDoc=(url,opts)=>core.tabFirst(fetcher,tabs,url,opts);
 
     // A tab navigation kills the content script outright - no catch block runs and nothing is
     // written. The checkpoint is what turns that from "the whole run is gone" into "the next run
@@ -312,7 +331,6 @@
         //---------------------------------------------------
 
         let processed=0;
-        let withProfile=0;
 
         await core.mapPool(companies,concurrency,async(company,index)=>{
 
@@ -332,11 +350,14 @@
 
                 company.failed=false;
 
-                const found=blocks(doc.body).join(" ").match(SIZE_DOC);
+                // Bounded, not a scan of the whole body. The fallback URL here is the JOB page,
+                // where "join our 200 employees" in the advert copy used to be read as the
+                // headcount and land in the file looking exactly like a real one.
+                const size=core.headcount(doc,{label:SIZE_LABEL,value:SIZE_DOC});
 
-                if(found){
-                    company.employees=found[0].replace(/\s+/g," ").trim();
-                    withProfile++;
+                if(size.text){
+                    company.employees=size.text;
+                    company.employeesSource=size.source;
                 }
                 else if(index<3){
                     console.warn(LOG,"no employee count on",url);
@@ -344,7 +365,12 @@
 
             }
 
-            processed++;
+            // guarded: the retry pass runs the same company again, and counting it twice made
+            // the progress line climb past the total it was counting towards
+            if(!company.counted){
+                company.counted=true;
+                processed++;
+            }
 
             report(`[${processed}/${companies.length}] ${company.name}`);
 
@@ -357,7 +383,10 @@
             onRetryPass:count=>report(`Retrying ${count} company page(s) that failed...`)
         });
 
+        // counted off the data at the end rather than incremented inside the worker, which the
+        // retry pass runs a second time for every company that failed the first
         const failed=companies.filter(company=>company.failed).length;
+        const withProfile=companies.filter(company=>company.employees).length;
 
         finish({companies,kept,skipped,withProfile,failed,paging,crashed:null});
 
@@ -433,8 +462,10 @@
             +`${withTime} with recruitment time.`
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
             +coverage
+            +(core.describeSizes(state.companies)?`\n${core.describeSizes(state.companies)}`:"")
             +(problems.length?"\n\n"+problems.join("\n"):"")
             +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")
+            +(tabs.describe()?`\n${tabs.describe()}`:"")
             +(state.crashed?`\n\nThe run stopped early: ${state.crashed}.`
                 +"\nEverything collected before that point is in the file above.":"");
 
@@ -678,6 +709,9 @@
                     profileUrl:"",
                     jobUrl:job.jobUrl,
                     employees:"",
+                    // "label" | "near" | "" - see core.headcount. Kept so the summary can say how
+                    // much of the Employees column is a field and how much is inference.
+                    employeesSource:"",
                     failed:false
                 };
 
