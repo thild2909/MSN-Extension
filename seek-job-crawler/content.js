@@ -57,6 +57,14 @@
     // than a number that happened to sit next to the word "employees"
     const SIZE_LABEL=/^(?:company size|size|employees|number of employees)$/i;
 
+    // Whether a page is worth building a DOM for at all. Both readings above need one of these
+    // strings somewhere in the markup - the labelled one because SIZE_LABEL is made of them, the
+    // loose one because SIZE_DOC ends in "employees" - so a body without either cannot produce a
+    // headcount, and parsing a few hundred KB to discover that is the most expensive way to
+    // learn nothing. Deliberately no /g flag: .test on a global regex advances lastIndex and
+    // would answer "no" for every other page.
+    const SIZE_HINT=/employee|company size/i;
+
     const jobs=[];
 
     // dedupe by job id: one listing can appear twice (sponsored + organic)
@@ -102,6 +110,19 @@
     let pageErrors=0;
     let resumed=0;
 
+    // where the wall clock actually went, so the next tuning pass is aimed rather than guessed.
+    // Module level, not carried in `state`: the crash path builds the file too, and a phase that
+    // did run should still be able to say how long it took.
+    let pagesMs=0;
+    let pageCount=0;
+    let companyMs=0;
+    let companyReads=0;
+
+    // job-page lookups abandoned once the sample said they were not paying for themselves
+    let droppedLookups=0;
+    let probed=0;
+    let probeHits=0;
+
     // set the moment the file is handed to the browser, so the crash path can never write a second one
     let fileWritten=false;
 
@@ -126,7 +147,7 @@
 
         let workArrangements=[];
         let maxPages=0;
-        let concurrency=6;
+        let concurrency=10;
 
         try{
 
@@ -135,7 +156,7 @@
             workArrangements=settings.workArrangements||[];
             maxPages=+settings.maxPages||0;
 
-            if(settings.concurrency) concurrency=Math.min(12,Math.max(1,+settings.concurrency));
+            if(settings.concurrency) concurrency=Math.min(24,Math.max(1,+settings.concurrency));
 
         }
         catch(e){
@@ -192,6 +213,10 @@
         let emptyStreak=0;
         let done=0;
 
+        pageCount=pages.length;
+
+        const pagesAt=performance.now();
+
         // No batch barrier: the pool keeps `concurrency` pages in flight at all times while the
         // main loop consumes them strictly in page order. The old slice-then-Promise.all pattern
         // paid the cost of the SLOWEST page in every batch and left every other worker idle.
@@ -223,7 +248,11 @@
 
             report(`Page ${page} (${done}/${pages.length}): +${found.added} -> ${jobs.length} jobs`);
 
-            await checkpoint.save({jobs});
+            // Not awaited. The throttle inside save() is set synchronously, so nothing stampedes,
+            // but the write itself is a structured clone of every job collected so far - and
+            // awaiting it held up the page the pipeline had already fetched and was ready to
+            // parse. The checkpoint exists to survive a crash, not to be read back mid-run.
+            checkpoint.save({jobs});
 
             // out of results, or the HTML returned by the server does not include the list
             if(page!==paging.current&&found.cards===0) emptyStreak++;
@@ -280,6 +309,8 @@
 
         }
 
+        pagesMs=performance.now()-pagesAt;
+
         console.log(LOG,"jobs found:",jobs.length);
 
         if(jobs.length===0){
@@ -328,42 +359,59 @@
         //---------------------------------------------------
         // 5. Employees is NOT on the results page, only on the company profile
         //    -> one extra request per company
+        //
+        // This phase IS the run. A search with 86 result pages has well over a thousand companies
+        // behind it, so it spends roughly fifteen requests here for every one pagination spent -
+        // which makes it the only place worth optimising. Everything below is about not spending
+        // them on pages that cannot answer the question.
         //---------------------------------------------------
+
+        const companiesAt=performance.now();
 
         let processed=0;
 
-        await core.mapPool(companies,concurrency,async(company,index)=>{
+        // Reads one company. Returns true/false for "did it publish a size", or null when the
+        // page never came back - which is not the same thing and must not be counted as a miss.
+        async function readSize(company){
 
             // prefer the /companies/<slug> page: it reliably carries the company size.
             // for companies with no SEEK profile, fall back to reading the job page.
             const url=company.profileUrl||company.jobUrl;
 
-            const doc=await fetchDoc(url);
+            const doc=await fetchDoc(url,{needs:SIZE_HINT});
 
             if(!doc){
 
                 // marked, not counted: the retry pass below decides whether this is a real failure
                 company.failed=true;
 
-            }
-            else{
-
-                company.failed=false;
-
-                // Bounded, not a scan of the whole body. The fallback URL here is the JOB page,
-                // where "join our 200 employees" in the advert copy used to be read as the
-                // headcount and land in the file looking exactly like a real one.
-                const size=core.headcount(doc,{label:SIZE_LABEL,value:SIZE_DOC});
-
-                if(size.text){
-                    company.employees=size.text;
-                    company.employeesSource=size.source;
-                }
-                else if(index<3){
-                    console.warn(LOG,"no employee count on",url);
-                }
+                return null;
 
             }
+
+            company.failed=false;
+
+            // Bounded, not a scan of the whole body. The fallback URL here is the JOB page,
+            // where "join our 200 employees" in the advert copy used to be read as the
+            // headcount and land in the file looking exactly like a real one.
+            const size=core.headcount(doc,{label:SIZE_LABEL,value:SIZE_DOC});
+
+            if(size.text){
+
+                company.employees=size.text;
+                company.employeesSource=size.source;
+
+                return true;
+
+            }
+
+            return false;
+
+        }
+
+        let lastTick=0;
+
+        function tick(company){
 
             // guarded: the retry pass runs the same company again, and counting it twice made
             // the progress line climb past the total it was counting towards
@@ -372,16 +420,97 @@
                 processed++;
             }
 
+            // A thousand companies is a thousand console lines and a thousand messages across the
+            // extension boundary, to update a status field that only ever shows the last one.
+            // The final tick always goes out, so the line does not stop short of the total.
+            const now=performance.now();
+
+            if(now-lastTick<200&&processed<companies.length) return;
+
+            lastTick=now;
+
             report(`[${processed}/${companies.length}] ${company.name}`);
 
-        },{
+        }
+
+        const retryPass={
             log:LOG,
             // A company refused at the busiest moment of the run is almost always readable once
             // the queue has drained. Without this its size cell is blank, and a blank cell is
             // indistinguishable from "this company publishes no headcount".
             shouldRetry:company=>company.failed===true,
             onRetryPass:count=>report(`Retrying ${count} company page(s) that failed...`)
-        });
+        };
+
+        // The two are not the same request. A company with a SEEK profile has a page built to
+        // publish its size; one without is read off a JOB ad, where a headcount is the exception.
+        // Running them together hid that: the useless half of the queue took just as long as the
+        // useful half and there was no way to tell from the outside.
+        const profiled=companies.filter(company=>company.profileUrl);
+        const adOnly=companies.filter(company=>!company.profileUrl);
+
+        report(`Reading ${profiled.length} company profile(s)...`);
+
+        await core.mapPool(profiled,concurrency,async company=>{
+
+            await readSize(company);
+
+            tick(company);
+
+        },retryPass);
+
+        // How many job ads are read before the yield decides whether to read the rest, and how
+        // much yield is worth carrying on for.
+        const PROBE=24;
+        const WORTH_IT=0.1;
+
+        if(adOnly.length){
+
+            report(`Checking ${adOnly.length} job ad(s) for a company size...`);
+
+            await core.mapPool(adOnly,concurrency,async company=>{
+
+                // Rather than guess whether job ads carry a size on this site, ask a sample and
+                // let the answer decide. Dropping the rest is said out loud in the summary,
+                // because a run that quietly skipped 600 lookups reads exactly like one where
+                // 600 companies publish no headcount.
+                if(probed>=PROBE&&probeHits<probed*WORTH_IT){
+
+                    droppedLookups++;
+
+                    tick(company);
+
+                    return;
+
+                }
+
+                const got=await readSize(company);
+
+                // a page that never arrived says nothing about the yield either way; it comes
+                // back round on the retry pass, where it is counted once and only once
+                if(got!==null){
+
+                    probed++;
+
+                    if(got) probeHits++;
+
+                }
+
+                tick(company);
+
+            },retryPass);
+
+            if(droppedLookups){
+
+                report(`Skipped ${droppedLookups} job ad lookup(s): the first ${probed} produced `
+                    +`${probeHits} employee count(s).`);
+
+            }
+
+        }
+
+        companyMs=performance.now()-companiesAt;
+        companyReads=companies.length-droppedLookups;
 
         // counted off the data at the end rather than incremented inside the worker, which the
         // retry pass runs a second time for every company that failed the first
@@ -449,7 +578,20 @@
                 +(jobs.length<total?` - ${total-jobs.length} NOT READ`:" - complete")
             : "";
 
+        // Where the wall clock went. The company phase is normally an order of magnitude bigger
+        // than pagination, and without this line every tuning decision about it is a guess.
+        const seconds=ms=>Math.round(ms/100)/10;
+
+        const phases=[
+            pagesMs?`${seconds(pagesMs)}s on ${pageCount} result page(s)`:"",
+            companyMs?`${seconds(companyMs)}s on ${companyReads} company page(s)`:""
+        ].filter(Boolean);
+
+        const breakdown=phases.length?`\nTime: ${phases.join(", ")}`:"";
+
         const problems=[
+            droppedLookups?`${droppedLookups} job ad lookup(s) skipped - the first ${probed} `
+                +`produced ${probeHits} employee count(s), so the rest were not worth the requests`:"",
             pageErrors?`${pageErrors} page request error(s)`:"",
             recoveredPages?`${recoveredPages} page(s) recovered on the retry pass`:"",
             missedPages.length?`${missedPages.length} page(s) could not be read at all -> ${missedPages.slice(0,12).join(", ")}`:"",
@@ -462,6 +604,7 @@
             +`${withTime} with recruitment time.`
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
             +coverage
+            +breakdown
             +(core.describeSizes(state.companies)?`\n${core.describeSizes(state.companies)}`:"")
             +(problems.length?"\n\n"+problems.join("\n"):"")
             +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")

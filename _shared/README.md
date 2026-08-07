@@ -62,9 +62,14 @@ node _shared/test/core.test.js _shared/core.js
 # all 7 content.js files against a stubbed DOM and reports any crawler that throws,
 # references something undefined, or dies in the export path
 node _shared/test/smoke.js .
+
+# drives seek-job-crawler through a search where no company has a SEEK profile and no job ad
+# publishes a headcount: the run must stop paying for the lookups, say so in the summary, and
+# still write every company to the file
+node _shared/test/seek-probe.test.js ./seek-job-crawler
 ```
 
-Run both after touching `core.js` or any `content.js`.
+Run all three after touching `core.js` or any `content.js`.
 
 ## What core.js guarantees
 
@@ -73,6 +78,6 @@ Run both after touching `core.js` or any `content.js`.
 | **Coverage** | A page that fails is stepped over (`walkPages.guessNext`), remembered, and retried at the end. It can never end the walk and silently truncate the list. |
 | **No data loss** | Whatever has been collected is written to a file even when the run crashes (`finish`/`salvage` in each crawler), and checkpointed to `chrome.storage.local` every few seconds so a tab navigation does not erase it either. |
 | **Fault tolerance** | Dropped connections, rate limits and permanent statuses are told apart and answered differently — retry, back off, give up. A failed fetch is never cached. |
-| **Speed** | Pacing is adaptive, floor zero: full speed until the site pushes back, penalty walked back down to the floor once it stops. Page fetching is a pipeline with no batch barrier. |
+| **Speed** | Pacing is adaptive, floor zero: full speed until the site pushes back, penalty walked back down to the floor once it stops. Page fetching is a pipeline with no batch barrier. Work that cannot produce an answer is not done: `fetchDoc(url, {needs})` skips building a DOM for a body that cannot contain what the caller came for, and `headcount()` reads each element only as far as it takes to reject it. |
 | **No invented values** | `headcount()` reads a company size from a labelled field, or from an element that *is* the value — never by running a regex over the whole `<body>`, where an advert saying "join our 200 employees" produced a headcount indistinguishable from a real one. Every value records which of the two it was, and `describeSizes()` puts the split in the summary. |
 | **A refusal is not the end** | 429/403/5xx is as often "that did not look like a browser" as "too fast", and backing off answers only one of the two. `makeTabFallback()` reopens the URL as a real top-level navigation, which carries the cookies, the TLS fingerprint and the JS a managed challenge asks for. If the check needs a person, the tab comes to the front — at most `askLimit` times a run, because one cleared check covers the whole site and the cheap path works again after it. |

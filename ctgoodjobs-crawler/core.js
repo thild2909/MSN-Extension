@@ -47,15 +47,24 @@ window.CrawlerCore = (function(){
 
     // split text per text node, so words do not run together when the markup has no whitespace
     // between tags ("Listed"+"five days ago" -> "Listedfive days ago" with textContent)
-    function blocks(el){
+    //
+    // `max` stops the walk once that many blocks have been collected. It is a hard stop, not a
+    // hint: a caller that asks for 13 is about to discard anything with more than 12, and walking
+    // a <div> wrapping half the page to find that out - once per element, on every page - was the
+    // single most expensive thing headcount() did.
+    function blocks(el,max){
 
         const parts=[];
 
         if(!el) return parts;
 
+        const limit=max>0?max:Infinity;
+
         (function walk(node){
 
             for(const child of node.childNodes){
+
+                if(parts.length>=limit) return;
 
                 if(child.nodeType===3){
 
@@ -73,6 +82,18 @@ window.CrawlerCore = (function(){
         })(el);
 
         return parts;
+
+    }
+
+    // One parsed empty document, handed back when a caller's `needs` test says the body cannot
+    // hold what it came for. Shared on purpose: it is only ever read from.
+    let blank=null;
+
+    function emptyDoc(){
+
+        if(!blank) blank=new DOMParser().parseFromString("","text/html");
+
+        return blank;
 
     }
 
@@ -559,6 +580,16 @@ window.CrawlerCore = (function(){
                 gate.relax();
 
                 if(settings.onOk) settings.onOk(response,html);
+
+                // Building the tree is the most expensive thing a fetch does - a company profile
+                // is a few hundred KB of markup and DOMParser walks all of it before anything
+                // reads one field out of it. When the caller wants a single value, a substring
+                // test on the raw body rules the page out in microseconds. `needs` is that test
+                // (no /g flag - .test on a global regex is stateful and would skip every other
+                // page). The empty document keeps the return type honest: a page with nothing in
+                // it has been READ, not refused, so it must not go round the retry ladder and the
+                // tab fallback on its way to the same answer.
+                if(settings.needs&&!settings.needs.test(html)) return emptyDoc();
 
                 return new DOMParser().parseFromString(html,"text/html");
 
@@ -1335,7 +1366,10 @@ window.CrawlerCore = (function(){
 
             for(const el of elements){
 
-                const parts=blocks(el);
+                // read one block past the point where the element stops being a field: that is
+                // all it takes to reject it, and reading the rest of a page-wide container is
+                // pure loss repeated for every element on the page
+                const parts=blocks(el,13);
 
                 // a container wrapping half the page pairs a label with whatever text happens to
                 // follow it several sections later
@@ -1356,10 +1390,21 @@ window.CrawlerCore = (function(){
         // 2. a leaf element that is mostly the value. The half-length rule is what separates
         //    "501-1000 Employees" in its own span from "Join our team of 200 employees" in an
         //    advert: the first IS the field, the second only mentions a number.
-        for(const el of elements){
+        for(let i=0;i<elements.length;i++){
 
-            if(el.querySelector(o.scope)) continue;
+            const el=elements[i];
+            const next=elements[i+1];
 
+            // A scope element containing another one is a section, not a field. Document order
+            // makes that an O(1) test: everything inside `el` comes immediately after it, so `el`
+            // has a scope descendant exactly when the NEXT entry in the list is one. The test
+            // this replaces was querySelector(scope) - a fresh subtree walk per element - which
+            // is the same elements x depth scan the bounded blocks() above exists to avoid.
+            if(next&&el.contains(next)) continue;
+
+            // deliberately unbounded: truncating here would SHORTEN the text and let something
+            // past the maxLen guard that the full read rejects, which is the wrong direction to
+            // be wrong in. The leaf test above has already thrown out everything large.
             const text=blocks(el).join(" ");
 
             if(!text||text.length>o.maxLen) continue;
@@ -1598,6 +1643,7 @@ window.CrawlerCore = (function(){
         norm,
         pick,
         blocks,
+        emptyDoc,
         clip,
         makeGate,
         makeFetcher,

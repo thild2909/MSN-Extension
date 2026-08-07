@@ -41,6 +41,8 @@ function fakeEl(depth){
             return null;
         },
         setAttribute(){},
+        // every fakeEl is minted fresh, so no two of them are ever related
+        contains:()=>false,
         querySelector:sel=>depth>3?null:fakeEl((depth||0)+1),
         querySelectorAll:sel=>depth>2?[]:[fakeEl((depth||0)+1)],
         click(){},

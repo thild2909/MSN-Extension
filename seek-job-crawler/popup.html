@@ -173,10 +173,12 @@
 <section>
     <div class="head">
         <strong>Speed</strong>
-        <label class="num">parallel <input type="number" id="concurrency" min="1" max="12" step="1" value="6"></label>
+        <label class="num">parallel <input type="number" id="concurrency" min="1" max="24" step="1" value="10"></label>
     </div>
-    <p class="hint">Requests running at the same time. Higher = faster, but SEEK may rate-limit you;
-    the crawler then slows itself down automatically. Drop to 2-3 if you see 429 errors.</p>
+    <p class="hint">Requests running at the same time. Almost the whole run is one request per
+    company, so this is the setting that decides how long it takes. Higher = faster, but SEEK may
+    rate-limit you; the crawler then slows itself down automatically and speeds back up once the
+    site stops pushing back. Drop to 2-3 if you see 429 errors.</p>
 </section>
 
 <button id="crawl">Crawl Search Results</button>

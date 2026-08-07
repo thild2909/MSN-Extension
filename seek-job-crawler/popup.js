@@ -12,7 +12,7 @@ const concurrency = document.getElementById("concurrency");
 
 // content.js clamps this too; here it only keeps the input from accepting absurd numbers
 function parallelValue() {
-    return Math.min(12, Math.max(1, parseInt(concurrency.value, 10) || 6));
+    return Math.min(24, Math.max(1, parseInt(concurrency.value, 10) || 10));
 }
 
 const groups = [

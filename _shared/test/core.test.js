@@ -205,6 +205,53 @@ console.log("\ncore.makeFetcher - a failed result is never cached");
     check("the retry was allowed through",!!second,"second="+second);
 }
 
+console.log("\ncore.makeFetcher - `needs` skips the parse without turning the page into a failure");
+{
+    let parses=0;
+
+    const RealParser=sandbox.DOMParser;
+
+    // count what actually reaches DOMParser: the whole point of `needs` is that a body which
+    // cannot hold the answer never gets a tree built for it. The one empty parse behind
+    // emptyDoc() is not a page and does not count.
+    sandbox.DOMParser=class{
+        parseFromString(html){
+            if(html) parses++;
+            return {html};
+        }
+    };
+
+    const gate=core.makeGate({minGap:0,limit:2});
+
+    const fetcher=core.makeFetcher(gate,{request:async url=>({
+        status:200,url,header:()=>null,
+        text:async()=>url.endsWith("/has")?"<p>1,001-5,000 employees</p>":"<p>nothing here</p>"
+    })});
+
+    const has=await fetcher.fetchDoc("https://x.test/has",{needs:/employee/i});
+    const parsedAfterHit=parses;
+
+    const hasnt=await fetcher.fetchDoc("https://x.test/hasnt",{needs:/employee/i});
+
+    check("a body that can answer is parsed",!!has&&has.html==="<p>1,001-5,000 employees</p>",
+        JSON.stringify(has));
+    check("and one that cannot is not",parses===parsedAfterHit,`${parses} vs ${parsedAfterHit}`);
+
+    // this is the part that matters: a skipped parse must read as "read it, nothing there", not
+    // as a refusal, or the page goes round the retry ladder and then the tab fallback for nothing
+    check("the skipped page is still a document",!!hasnt,String(hasnt));
+    check("an empty one",core.emptyDoc()===hasnt,JSON.stringify(hasnt));
+    check("and it cost no extra requests",fetcher.stats.requests===2,String(fetcher.stats.requests));
+
+    // a caller that asks for nothing still gets the tree, exactly as before
+    const plain=await fetcher.fetchDoc("https://x.test/plain");
+
+    check("no `needs` means parse as always",!!plain&&plain.html==="<p>nothing here</p>",
+        JSON.stringify(plain));
+
+    sandbox.DOMParser=RealParser;
+}
+
 console.log("\ncore.pipelinePages - pages are consumed in order and failures are reported, not swallowed");
 {
     const gate=core.makeGate({minGap:0,limit:4});
@@ -540,6 +587,27 @@ function el(tag,...children){
 
     node.querySelector=selector=>node.querySelectorAll(selector)[0]||null;
 
+    // headcount() tells a field from a section with contains(), so the stub has to have it
+    node.contains=other=>{
+
+        if(other===node) return true;
+
+        return (function walk(from){
+
+            for(const child of from.childNodes){
+
+                if(child===other) return true;
+
+                if(child.nodeType===1&&walk(child)) return true;
+
+            }
+
+            return false;
+
+        })(node);
+
+    };
+
     return node;
 
 }
@@ -602,6 +670,43 @@ console.log("\ncore.headcount - a long element is a section, not a field");
         {label:LABEL,value:EMPLOYEES,scope:SCOPE});
 
     check("skipped it",long.text==="",JSON.stringify(long));
+}
+
+console.log("\ncore.headcount - a container is still a container, however it is detected");
+{
+    // the leaf test used to be querySelector(scope) per element; it is now a document-order
+    // comparison, and the two have to disagree about nothing
+    const nested=core.headcount(
+        el("body",el("div",el("p",el("span","3,000 employees")))),
+        {label:LABEL,value:EMPLOYEES,scope:SCOPE});
+
+    check("read the innermost element, not the wrappers",nested.text==="3,000 employees",
+        JSON.stringify(nested));
+    check("and did not call it a labelled field",nested.source==="near",nested.source);
+
+    // a wrapper whose own text would match, with a scope element inside it: the wrapper is a
+    // section and only what is inside it may be read
+    const wrapped=core.headcount(
+        el("body",el("div","Join our team of 200 employees",el("p","and grow with us"))),
+        {label:LABEL,value:EMPLOYEES,scope:SCOPE});
+
+    check("a wrapper's own text is not a field",wrapped.text==="",JSON.stringify(wrapped));
+}
+
+console.log("\ncore.blocks - a bounded read stops at the limit");
+{
+    const wide=el("div",...Array.from({length:50},(_,i)=>el("p","block "+i)));
+
+    check("unbounded reads everything",core.blocks(wide).length===50,core.blocks(wide).length);
+    check("bounded stops there",core.blocks(wide,13).length===13,core.blocks(wide,13).length);
+    check("and the blocks it did read are the first ones",core.blocks(wide,3).join("|")==="block 0|block 1|block 2",
+        core.blocks(wide,3).join("|"));
+
+    // headcount asks for 13 to decide "more than 12", so the two have to agree at the boundary
+    const twelve=el("div",...Array.from({length:12},(_,i)=>el("p","block "+i)));
+
+    check("a 12 block element is read in full",core.blocks(twelve,13).length===12,
+        core.blocks(twelve,13).length);
 }
 
 console.log("\ncore.describeSizes - the summary says how much of the column is a field");
