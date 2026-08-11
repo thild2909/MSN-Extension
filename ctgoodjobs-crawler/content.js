@@ -73,6 +73,33 @@
 
     const report=core.makeReporter("ctgj-crawler-status",LOG);
 
+    //---------------------------------------------------
+    // what to do when the paginator stops turning
+    //
+    // This crawler drives the live tab and never makes an HTTP request, which is why it shipped
+    // without a background worker. It still meets the same wall every other crawler here does: a
+    // long walk gets some way in - page 28 of 40 in the run this was written for - and then the
+    // app's own page request starts coming back 405. Nothing on screen changes, so clickPager
+    // waits out its 15 seconds, the retries turn the same refusal into ?page=30, and the walk used
+    // to stop there and write a file missing a third of the search.
+    //
+    // A 405 on the app's client-side page request is answered by the same thing a 403 is: opening
+    // the URL as a REAL top-level navigation, which carries the cookies, the TLS fingerprint and
+    // the JavaScript the edge is looking for. tabs.js opens that tab in the background, waits for
+    // the app to render, lifts the finished DOM out, and closes the tab again - so the rest of the
+    // pages are read without the user losing their window.
+    //
+    // A fetch() could never stand in for this: jobs.ctgoodjobs.hk renders its list client side, so
+    // ?page=29 over HTTP is an empty shell with no .job-card in it. A tab is a real browser and
+    // renders it for real, which is the whole reason this path is worth the seconds it costs.
+    //---------------------------------------------------
+
+    const tabs=core.makeTabFallback({
+        log:LOG,
+        report,
+        describe:url=>"page "+(core.paramOf(url,"page",location.origin)||1)
+    });
+
     // The tab navigating away kills the content script outright - no catch block runs and nothing
     // is written. The checkpoint turns that from "the whole run is gone" into "the next run starts
     // where this one stopped", which matters here more than anywhere else: this crawler drives the
@@ -84,6 +111,11 @@
 
     let resumed=0;
     let pageRetries=0;
+
+    // pages the live tab would not turn to and that were reopened in a background tab instead.
+    // Out here with the others: finish() sits outside the try block and cannot see anything
+    // declared inside it.
+    let tabPages=0;
 
     // read from the popup below, but declared out here: finish() sits outside the try block and
     // cannot see anything declared inside it
@@ -175,8 +207,18 @@
         console.log(LOG,`pagination: current=${paging.current}, last=${paging.last} `
             +`(${paging.totalJobs} jobs), crawling up to page ${lastPage}`);
 
+        // Ask now, while nothing is on fire. The fallback is only needed deep into a walk, and a
+        // worker that turns out to be unreachable at page 29 has already cost the run the twenty
+        // minutes it took to get there.
+        if(await tabs.ready()) console.log(LOG,"tab fallback is ready");
+
         let pageErrors=0;
         let emptyStreak=0;
+
+        // Once a page has had to be read in a background tab, the LIVE tab is still parked on the
+        // page before it and its "next" link no longer points where the walk is. Every page from
+        // there on is read the same way rather than clicking a paginator that is out of step.
+        let viaTab=false;
 
         // Pages are turned in the LIVE TAB, not fetched.
         //
@@ -186,6 +228,10 @@
         // and stopped - which is exactly why a search of 1,089 jobs came back with the 30 that
         // happened to be rendered on page 1. Clicking the paginator lets the app render each
         // page for real, and collectFrom then reads the same DOM the user sees.
+        //
+        // The one exception is readPageInTab, and it is not a fetch: it opens the URL in a real
+        // background tab, where the app boots and renders exactly as it does here. That is the
+        // only thing that gets past a page the paginator refuses to turn.
         window.addEventListener("beforeunload",()=>{
             console.error(LOG,"the tab is navigating away - the crawl cannot survive a full page load."
                 +" Collected so far: "+jobs.length+" job(s).");
@@ -193,7 +239,7 @@
 
         for(let page=paging.current;page<=lastPage;page++){
 
-            if(page>paging.current){
+            if(page>paging.current&&!viaTab){
 
                 // A page turn that did not take is usually the app still rendering, not the end
                 // of the list. Giving up on the first attempt cost every page behind it, so try
@@ -217,27 +263,50 @@
 
                 }
 
+                // The paginator is not coming back. Past this point the app answers its own page
+                // request with 405 and simply leaves the previous list on screen, which is a
+                // refusal rather than the end of the results - so hand the rest of the walk to the
+                // tab fallback instead of stopping here with most of the search unread.
                 if(!turned){
 
                     pageErrors++;
 
-                    console.warn(LOG,`could not reach page ${page} after ${PAGE_TRIES} tries, `
-                        +`stopping with ${jobs.length} job(s)`);
+                    console.warn(LOG,`could not reach page ${page} after ${PAGE_TRIES} tries `
+                        +"- reopening it, and everything after it, in a background tab");
 
-                    break;
+                    viaTab=true;
 
                 }
 
             }
 
-            const found=collectFrom(document);
+            const found=viaTab?await readPageInTab(paging.pageUrl(page)):collectFrom(document);
 
-            // must happen while this page is still on screen - the cards are gone once the
-            // paginator moves on
-            const models=readModelEnabled?await readModelsOnPage():0;
+            // the tab could not be opened or read either: this really is as far as the run goes
+            if(!found){
+
+                pageErrors++;
+
+                console.warn(LOG,`page ${page} could not be read in a tab either, `
+                    +`stopping with ${jobs.length} job(s)`);
+
+                report(`Page ${page} could not be reached in this tab or a new one - stopping with `
+                    +`${jobs.length} job(s).`);
+
+                break;
+
+            }
+
+            if(viaTab) tabPages++;
+
+            // Must happen while this page is still on screen - the cards are gone once the
+            // paginator moves on. A page read in a background tab has no results panel to click:
+            // the tab is opened, read and closed again, so those pages contribute no work model.
+            const models=(readModelEnabled&&!viaTab)?await readModelsOnPage():0;
 
             report(`Page ${page}/${lastPage}: ${found.cards} cards, +${found.added} -> ${jobs.length} jobs`
-                +(readModelEnabled?`, +${models} work models`:""));
+                +(readModelEnabled&&!viaTab?`, +${models} work models`:"")
+                +(viaTab?" (read in a background tab)":""));
 
             // written after every page: the walk drives the live tab, so anything that navigates
             // it kills the script outright and no catch block ever runs
@@ -404,6 +473,18 @@
             : "";
 
         if(pageRetries) notes.push(`${pageRetries} page turn(s) had to be retried before the app rendered them.`);
+
+        // Say it plainly: those pages are in the file, but their companies carry no work model,
+        // and a blank column that has a reason is not the same as one that is a bug.
+        if(tabPages){
+
+            notes.push(`${tabPages} page(s) would not turn in this tab and were reopened in a `
+                +"background tab instead - their companies have no Remote/Onsite, because that is "
+                +"only readable from the results panel in the live tab.");
+
+        }
+
+        if(tabs.describe()) notes.push(tabs.describe());
 
         if(resumed) notes.push(`Resumed ${resumed} job(s) from an earlier unfinished run.`);
 
@@ -684,6 +765,28 @@
         }
 
         return read;
+
+    }
+
+    // Reopen one search page as a real top-level navigation and read the cards out of it.
+    //
+    // The URL is passed in rather than derived here: `paging` is block-scoped inside the try above
+    // and this function, like every helper at the end of the file, cannot see it.
+    //
+    // Returns null when the tab could not be opened, was refused as well, or the worker is not
+    // there - the caller stops on that. A tab that renders but has no cards is NOT null: that is a
+    // real answer ("this page is empty"), and the emptyStreak guard in the walk already knows what
+    // to do with two of them in a row.
+    async function readPageInTab(url){
+
+        const doc=await tabs.fetchDoc(url);
+
+        if(!doc){
+            console.warn(LOG,"the background tab returned nothing for",url);
+            return null;
+        }
+
+        return collectFrom(doc);
 
     }
 

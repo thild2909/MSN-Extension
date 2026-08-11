@@ -61,6 +61,18 @@
     // consecutive 403s that mean "blocked", not "slow down" (see the forbidden breaker)
     const FORBIDDEN_LIMIT=8;
 
+    // ...and how many of the requests this breaker turns away are worth one that goes out anyway,
+    // to find out whether it still is. The breaker used to latch for the whole run - `tripped` was
+    // set and never cleared - so a bad half minute at company 40 committed all 800 after it to a
+    // tab load each, long after Wellfound had stopped minding.
+    //
+    // Small on purpose, because it MULTIPLIES with the tab fallback's own re-test: once tabs are
+    // carrying the run, core.tabFirst does not consult this guard at all except on the pages where
+    // the fallback has deliberately let the cheap path go first (every preferAfter+recheck = 13th).
+    // At 25 the two together came to one plain request per 325 pages, which on any real search is
+    // the same as never.
+    const FORBIDDEN_RECHECK=2;
+
     // The pace floor is zero on purpose. A fixed 150ms toll was paid on every one of ~1,700
     // requests whether or not Wellfound minded - about four minutes of a run spent waiting for
     // nothing. The gate below widens the moment anything is actually refused, so being rate
@@ -77,6 +89,13 @@
         total:0,
         tripped:false,
 
+        // `tripped` can now be cleared again, so it no longer answers "did this run get blocked?"
+        // - and that is the question the summary asks, to explain a column filled from tabs
+        everTripped:false,
+
+        // requests the guard has skipped since the last one it let through - see FORBIDDEN_RECHECK
+        skipped:0,
+
         hit(url){
 
             this.streak++;
@@ -85,16 +104,58 @@
             if(this.streak>=FORBIDDEN_LIMIT&&!this.tripped){
 
                 this.tripped=true;
+                this.everTripped=true;
 
                 console.warn(LOG,`${this.streak} requests in a row returned 403 (last: ${url}).`
-                    +" Wellfound is blocking detail pages - falling back to list-page data only.");
+                    +" Wellfound is blocking detail pages - they will be reopened in a background"
+                    +" tab instead, and a plain request tried again now and then in case that stops.");
 
             }
 
         },
 
+        // True while the cheap path is not worth sending - except for every FORBIDDEN_RECHECK-th
+        // request, where one is let through to see whether the block has lifted.
+        blocked(){
+
+            if(!this.tripped) return false;
+
+            // Nothing else is going to read these pages, so a request that will probably be
+            // refused has stopped being the more expensive option - it is the only one left. What
+            // it costs in cooldowns is bounded by the gate, which writes the session off once it
+            // has waited long enough; a page nobody asks for is simply blank in the file.
+            if(!tabs.available) return false;
+
+            if(++this.skipped<FORBIDDEN_RECHECK) return true;
+
+            this.skipped=0;
+
+            // give the probe a clean run at FORBIDDEN_LIMIT rather than judging it on refusals
+            // that happened before the whole rest of the run had a chance to cool off
+            this.streak=0;
+
+            return false;
+
+        },
+
+        // a refusal that is NOT 403 - a 429 is about pace, and it breaks the 403 streak without
+        // saying the block has gone
         ok(){
             this.streak=0;
+        },
+
+        // a plain request came back with a page: the cheap path works again
+        clear(){
+
+            this.streak=0;
+            this.skipped=0;
+
+            if(!this.tripped) return;
+
+            this.tripped=false;
+
+            console.log(LOG,"a plain request came back - using the cheap path again");
+
         }
 
     };
@@ -120,8 +181,8 @@
     // shape of a bot check, and a bot check is answered by a real navigation rather than by
     // waiting. tabFirst takes over from here, and only the tab budget bounds it.
     const cheap=(url,opts)=>fetcher.fetchDoc(url,Object.assign({
-        guard:()=>forbidden.tripped,
-        onOk:()=>forbidden.ok()
+        guard:()=>forbidden.blocked(),
+        onOk:()=>forbidden.clear()
     },opts||{}));
 
     const tabs=core.makeTabFallback({
@@ -137,14 +198,9 @@
     const unique=[];
     const visited=new Set();
 
-    // Stats used to cross-check the number Wellfound prints at the bottom of the page.
-    // NOTE: this only COUNTS, it never filters. Deduping happens only at company level in push().
-    const jobHrefs=new Set();
-
     const stats={
         companyDupes:0,   // company card seen again -> dropped by push()
-        jobsSeen:0,       // total jobs read across every list page
-        jobDupes:0,       // job whose link was seen before -> still kept, only counted
+        jobsSeen:0,       // total job entries read across every list page
         cards:0,          // company cards found on list pages
         cardsNoLink:0,    // cards with no /company/ anchor -> skipped entirely
         cards3Plus:0,     // cards rendering 3+ jobs -> Wellfound is likely capping the card
@@ -220,6 +276,16 @@
         gate.limit=concurrency;
         gate.maxLimit=concurrency;
 
+        // Wellfound refuses detail pages far more often than it rate limits them, so on this
+        // crawler "every page needs a tab" is the ordinary case rather than the bad day. That
+        // makes the tab worker's width the crawl's real width, and it was being left at the
+        // worker's own default of 4 however wide the popup was set.
+        tabs.setLimit(concurrency);
+
+        // Wake the worker before the first refusal needs it, and say now - rather than after
+        // twenty refused pages - if there is no worker to wake.
+        if(await tabs.ready()) console.log(LOG,"tab fallback is ready");
+
         //---------------------------------------------------
         // 1b. pick up an unfinished run on the same search
         //     A crawl that died with the tab left its companies in storage; re-reading those
@@ -238,9 +304,11 @@
                 unique.push(company);
                 resumed++;
 
-            }
+                // these never go through push(), so their jobs have to be counted here or the
+                // summary of a resumed run reads as though half its companies had no positions
+                stats.jobsSeen+=(company.jobs||[]).length;
 
-            for(const href of saved.jobHrefs||[]) jobHrefs.add(href);
+            }
 
             report(`Resumed ${resumed} compan${resumed===1?"y":"ies"} from an unfinished run on this search.`);
 
@@ -314,7 +382,7 @@
             report(`Page ${page} (${done}/${pages.length}): ${found.cards} cards, ${found.jobs} jobs,`
                 +` +${found.added} new -> ${unique.length} companies`);
 
-            await checkpoint.save({unique,jobHrefs:[...jobHrefs]});
+            await checkpoint.save({unique});
 
             // the HTML returned by the server may not include the list (client-side rendering)
             if(page!==paging.current&&found.cards===0) emptyStreak++;
@@ -366,7 +434,7 @@
 
             }
 
-            await checkpoint.save({unique,jobHrefs:[...jobHrefs]},true);
+            await checkpoint.save({unique},true);
 
         }
         else{
@@ -430,6 +498,14 @@
         //---------------------------------------------------
         // 3. crawl locations, filter by size
         //---------------------------------------------------
+
+        // Size the tab budget to the work that is actually in front of it, now that the list is
+        // known. The default is a flat 80, which on a search this size decided the export: once
+        // the breaker above stops sending requests, EVERY company needs a tab, and companies 81
+        // onwards were getting neither - no request, no tab, and a blank Location and Employees
+        // with nothing in the console to say why. Two per company: the profile, and the /jobs tab
+        // for cards that printed no jobs.
+        tabs.setBudget(unique.length*2);
 
         // write by index and filter afterwards: work runs in parallel so completion order is
         // scrambled; this keeps the Excel file in the same company order as the page
@@ -636,8 +712,7 @@
 
             const msg=`No company matched the size filter (${buckets.join(", ")}).`
                 +`\nCompanies: ${unique.length} unique, ${stats.companyDupes} duplicate card(s) skipped, ${skipped} skipped by size.`
-                +`\nJobs: ${stats.jobsSeen} seen`+(totals.results?` / ${totals.results} on platform`:"")
-                +`, ${stats.jobDupes} duplicate link(s) kept.`;
+                +`\nJobs: ${stats.jobsSeen} read off the list pages.`;
             console.warn(LOG,msg);
             alert(msg);
             return;
@@ -709,15 +784,6 @@
         const withTime=results.filter(r=>r["Recruitment time"]).length;
         const elapsed=Math.round((performance.now()-startedAt)/1000);
 
-        // Compare DISTINCT jobs, not card entries. Wellfound paginates by company but its
-        // ranking shifts while we crawl, so the same company can land on two pages. It is one
-        // company on their side, and counting its jobs twice would flatter the number.
-        const jobsDistinct=jobHrefs.size;
-
-        // gap against the number Wellfound prints on the page: negative = the crawl missed some
-        const gap=totals.results?jobsDistinct-totals.results:0;
-        const sign=gap>0?"+":"";
-
         const missing=state.missingPages||lostPages;
 
         const summary=[
@@ -733,9 +799,6 @@
             missing.length
                 ? `Missing:   ${missing.length} page(s) never parsed -> ${missing.slice(0,15).join(", ")}${missing.length>15?", ...":""}`
                 : `Missing:   none, every page parsed`,
-            `Jobs:      ${jobsDistinct} distinct`
-                +(totals.results?` (${sign}${gap} vs platform)`:"")
-                +`, ${stats.jobsSeen} card entries, ${stats.jobDupes} repeat link(s)`,
             `Cards:     ${stats.cards} company cards`
                 +(stats.cardsNoLink?`, ${stats.cardsNoLink} without a company link`:"")
                 +`, ${stats.cards3Plus} showing 3+ jobs (per-card cap hides the rest)`,
@@ -745,7 +808,10 @@
                 +(stats.skippedNoSize?` - WARNING: ${stats.skippedNoSize} of those had no size at all`:""),
             forbidden.total
                 ? `Blocked:   ${forbidden.total} request(s) got 403`
-                    +(forbidden.tripped?" - the cheap path gave up, pages came from tabs or list data":"")
+                    +(forbidden.everTripped
+                        ? " - plain requests were given up on, pages came from tabs or list data"
+                            +(forbidden.tripped?"":" until they started working again")
+                        : "")
                 : `Blocked:   none`,
             `Filled:    ${withLocation} location, ${withPositions} positions, ${withTime} recruitment time`,
             core.describeSizes(state.exported||[]),
@@ -759,8 +825,7 @@
         console.log(LOG,"\n"+summary);
 
         // the popup only has a single status line -> send the short version
-        report(`Done: ${results.length} companies, ${jobsDistinct} distinct jobs`
-            +(totals.results?` / ${totals.results} on platform`:"")
+        report(`Done: ${results.length} companies`
             +`, ${stats.companyDupes} duplicate companies skipped.`);
 
         // the run reached the file, so there is nothing left to resume
@@ -892,15 +957,6 @@
         // Count jobs BEFORE dropping duplicate companies: Wellfound counts "results" as jobs,
         // so the jobs on a repeated card are part of that number too.
         stats.jobsSeen+=list.length;
-
-        for(const job of list){
-
-            if(!job.href) continue;
-
-            if(jobHrefs.has(job.href)) stats.jobDupes++;
-            else jobHrefs.add(job.href);
-
-        }
 
         if(visited.has(url)){
             stats.companyDupes++;

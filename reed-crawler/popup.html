@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <style>
+        /* accent color is per-extension, everything else is shared */
+        :root{
+            --accent:#1e1ef0;
+            --bg:#ffffff;
+            --fg:#1b1b1f;
+            --muted:#6b7280;
+            --line:#e5e7eb;
+            --field:#ffffff;
+        }
+
+        @media (prefers-color-scheme: dark){
+            :root{
+                --bg:#1f2023;
+                --fg:#e8e8ea;
+                --muted:#9aa0a6;
+                --line:#3a3b3f;
+                --field:#2a2b2f;
+            }
+        }
+
+        *{box-sizing:border-box}
+
+        body{
+            width:300px;
+            margin:0;
+            padding:14px;
+            background:var(--bg);
+            color:var(--fg);
+            font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+        }
+
+        h1{
+            display:flex;
+            align-items:center;
+            gap:8px;
+            margin:0 0 14px;
+            font-size:13.5px;
+            font-weight:600;
+        }
+
+        h1::before{
+            content:"";
+            width:8px;
+            height:8px;
+            border-radius:50%;
+            background:var(--accent);
+            flex:none;
+        }
+
+        section{margin-bottom:14px}
+
+        .head{
+            display:flex;
+            justify-content:space-between;
+            align-items:baseline;
+            gap:8px;
+            margin-bottom:6px;
+        }
+
+        .head strong{font-size:12px;font-weight:600}
+
+        input[type=checkbox]{
+            width:14px;
+            height:14px;
+            margin:0;
+            flex:none;
+            accent-color:var(--accent);
+        }
+
+        .num{
+            display:flex;
+            align-items:center;
+            gap:6px;
+            font-size:12px;
+            color:var(--muted);
+        }
+
+        .num input{
+            width:80px;
+            padding:4px 6px;
+            border:1px solid var(--line);
+            border-radius:6px;
+            background:var(--field);
+            color:var(--fg);
+            font:inherit;
+        }
+
+        .num input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+
+        .hint{margin:6px 0 0;font-size:11px;color:var(--muted)}
+
+        #crawl{
+            width:100%;
+            padding:10px;
+            border:0;
+            border-radius:8px;
+            background:var(--accent);
+            color:#fff;
+            font:600 13px/1 inherit;
+            cursor:pointer;
+        }
+
+        #crawl:hover{filter:brightness(1.08)}
+        #crawl:disabled{opacity:.6;cursor:default}
+
+        #status{
+            margin-top:10px;
+            min-height:1.2em;
+            font-size:11.5px;
+            color:var(--muted);
+            word-break:break-word;
+        }
+
+        .checkline{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
+    </style>
+</head>
+
+<body>
+
+<h1>Reed</h1>
+
+<section>
+    <div class="head">
+        <strong>Pages</strong>
+        <label class="num">max pages <input type="number" id="maxPages" min="1" step="1" placeholder="all"></label>
+    </div>
+    <p class="hint">Reads the list, then follows the &ldquo;Next&rdquo; link and repeats. Blank = go to the last page
+    (a wide search can be 140 pages &times; 25 jobs).</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Company profiles</strong>
+        <label class="checkline"><input type="checkbox" id="profiles" checked> open</label>
+    </div>
+    <p class="hint">Employees is on no job card, so the recruiter&rsquo;s profile page is opened once per company.
+    Few Reed profiles publish a headcount &mdash; a sample is read first and the rest are skipped if it
+    comes back empty. Turn it off and the column stays blank.</p>
+</section>
+
+<section>
+    <div class="head">
+        <strong>Speed</strong>
+        <label class="num">parallel <input type="number" id="concurrency" min="1" max="12" step="1" value="4"></label>
+    </div>
+    <p class="hint">Requests running at the same time. Drop to 2 if the console shows 403 or 429.</p>
+</section>
+
+<button id="crawl">Crawl Search Results</button>
+
+<div id="status"></div>
+
+<!-- xlsx.full.min.js is not loaded here: it gets injected into the tab by popup.js -->
+<script src="popup.js"></script>
+
+</body>
+
+</html>

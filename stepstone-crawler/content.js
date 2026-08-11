@@ -127,8 +127,35 @@
         log:LOG,
         report,
         lastStatus:fetcher.lastStatus,
-        describe:url=>"page "+(core.paramOf(url,"page",ORIGIN)||1)
+        describe:describeUrl
     });
+
+    // Enough of a URL to recognise it in a status line.
+    //
+    // This used to be `"page "+(paramOf(url,"page")||1)`, which is only ever right for the results
+    // walk. Job ads and company pages carry no ?page= at all, so every one of them fell through to
+    // the `||1` and announced itself as "page 1" - the detail phase reopened dozens of different
+    // ads and printed the same line for all of them, which reads like a run stuck in a loop when it
+    // is simply mislabelled.
+    function describeUrl(url){
+
+        const page=core.paramOf(url,"page",ORIGIN);
+
+        if(page) return "page "+page;
+
+        // .../jobs--Sports-Scientist-m-f-x-Berlin-Schmidt-Hagius-GmbH-Co-KG--13760838-inline.html
+        const ad=/--(\d+)(?:-inline)?\.html/.exec(url);
+
+        if(ad) return "job "+ad[1];
+
+        try{
+            return new URL(url,ORIGIN).pathname.replace(/^\/+|\/+$/g,"")||url;
+        }
+        catch(e){
+            return url;
+        }
+
+    }
 
     const fetchDoc=(url,opts)=>core.tabFirst(fetcher,tabs,url,opts);
 

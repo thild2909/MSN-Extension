@@ -818,6 +818,147 @@ console.log("\ncore.makeTabFallback - a browser that cannot open tabs is not ask
         `${outbox.length} vs ${before}`);
 }
 
+// The fallback's whole premise is that a real navigation succeeds where a fetch was refused. When
+// the navigation fails too, the premise is gone - the trouble is under both of them. A VPN mangling
+// HTTP/2 does exactly that, and the run it was found on opened 80 tabs, rescued nothing, and said
+// the same thing 80 times.
+console.log("\ncore.makeTabFallback - a tab path that is failing is given up on, not repeated 80 times");
+{
+    const said=[];
+    const tabs=fallback({budget:80,giveUpAfter:5,report:t=>said.push(t)});
+
+    tabReply={ok:false,error:"Frame with ID 0 is showing error page"};
+
+    for(let i=0;i<5;i++) await tabs.get("u"+i);
+
+    check("it stops after the run of failures, not at the budget",tabs.off==="failing",
+        tabs.off+" used="+tabs.used);
+    check("...having spent 5 tabs on it rather than 80",tabs.used===5,"used="+tabs.used);
+
+    check("and says it is the connection, not the site",
+        said.some(t=>/connection itself is the problem/i.test(t)),said.join(" | "));
+
+    check("...quoting what the tabs actually failed with",
+        said.some(t=>/showing error page/i.test(t)),said.join(" | "));
+
+    const before=outbox.length;
+
+    await tabs.get("u9");
+
+    check("no further round trip is spent on it",outbox.length===before,
+        `${outbox.length} vs ${before}`);
+
+    check("the summary admits it",/stopped after 5 in a row failed to load/.test(tabs.describe()),
+        tabs.describe());
+}
+
+// Same stop, opposite advice: a wall the person can clear is not a broken connection, and telling
+// them to go and look at their VPN sends them nowhere.
+console.log("\ncore.makeTabFallback - a wall every tab hits is reported as a wall, not as the network");
+{
+    const said=[];
+    const tabs=fallback({giveUpAfter:3,askLimit:0,report:t=>said.push(t)});
+
+    tabReply={ok:false,challenged:true,error:"the check on the page was still there after 15s"};
+
+    for(let i=0;i<3;i++) await tabs.get("u"+i);
+
+    check("it still stops",tabs.off==="failing",tabs.off);
+    check("but names the check, not the connection",
+        said.some(t=>/clear the check by hand/i.test(t))&&!said.some(t=>/VPN or proxy/i.test(t)),
+        said.join(" | "));
+    check("...and the summary agrees",/still showing the site's check/.test(tabs.describe()),
+        tabs.describe());
+}
+
+console.log("\ncore.makeTabFallback - one tab that works clears the run of failures");
+{
+    const tabs=fallback({giveUpAfter:3});
+
+    tabReply={ok:false,error:"boom"};
+
+    await tabs.get("a");
+    await tabs.get("b");
+
+    tabReply={ok:true,html:"<html></html>",url:"c"};
+
+    await tabs.get("c");
+
+    check("a success resets the counter",tabs.misses===0,"misses="+tabs.misses);
+
+    tabReply={ok:false,error:"boom"};
+
+    await tabs.get("d");
+    await tabs.get("e");
+
+    check("...so two more failures are not the third strike",tabs.off===""&&tabs.available===true,
+        tabs.off);
+}
+
+console.log("\ncore.makeFetcher - a connection that answers nothing is written off, not asked 644 times");
+{
+    let calls=0;
+
+    const gate=core.makeGate({minGap:0,limit:1});
+
+    const fetcher=core.makeFetcher(gate,{
+        maxTransport:2,
+        transportPause:0,
+        maxTransportStreak:4,
+        request:async()=>{
+            calls++;
+            throw new Error("net::ERR_HTTP2_PROTOCOL_ERROR");
+        }
+    });
+
+    for(let i=0;i<4;i++) await fetcher.fetchDoc("https://x.test/job"+i);
+
+    check("the session is written off",gate.dead===true);
+
+    // 4 URLs x maxTransport 2 = 8, and not one attempt more
+    check("...after the run of URLs, not after all of them",calls===8,"calls="+calls);
+
+    const before=calls;
+
+    await fetcher.fetchDoc("https://x.test/job99");
+
+    check("later URLs cost no request at all",calls===before,`${calls} vs ${before}`);
+
+    check("and the summary says the run was cut short",
+        /stopped early/.test(fetcher.describe()),fetcher.describe());
+}
+
+console.log("\ncore.makeFetcher - a bad patch of network is not a dead connection");
+{
+    let calls=0;
+
+    const gate=core.makeGate({minGap:0,limit:1});
+
+    // every other URL answers: the connection is plainly alive, however ugly it looks
+    const fetcher=core.makeFetcher(gate,{
+        maxTransport:1,
+        transportPause:0,
+        maxTransportStreak:4,
+        request:async url=>{
+
+            calls++;
+
+            if(/odd/.test(url)) throw new Error("net::ERR_HTTP2_PROTOCOL_ERROR");
+
+            return {status:200,url,header:()=>null,text:async()=>"<p>ok</p>"};
+
+        }
+    });
+
+    for(let i=0;i<12;i++){
+        await fetcher.fetchDoc("https://x.test/"+(i%2?"odd":"even")+i);
+    }
+
+    check("the run is left alone",gate.dead===false);
+    check("...and every good page still came back",fetcher.stats.netErrors===6,
+        JSON.stringify(fetcher.stats));
+}
+
 console.log("\ncore.makeFetcher - a twice-refused page is handed to the fallback, not to the ladder");
 {
     for(const status of [429,503,403,500,502]){

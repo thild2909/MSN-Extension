@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "CTgoodjobs Crawler",
-  "version": "1.2",
+  "name": "Reed Company Crawler",
+  "version": "1.0",
   "background": {
     "service_worker": "background.js"
   },
@@ -12,7 +12,7 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://jobs.ctgoodjobs.hk/*"
+    "https://www.reed.co.uk/*"
   ],
   "icons": {
     "16": "icons/icon16.png",
@@ -22,7 +22,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "CTgoodjobs Crawler",
+    "default_title": "Reed Company Crawler",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

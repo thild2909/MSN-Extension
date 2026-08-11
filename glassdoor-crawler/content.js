@@ -122,6 +122,78 @@
     // hundred needless passes over a full job page.
     const overviews=new WeakMap();
 
+    //---------------------------------------------------
+    // reading three fields without reading a megabyte
+    //
+    // The "Company overview" block is a few hundred bytes in the middle of a job page that is
+    // usually 1-2 MB, nearly all of it a JSON blob for Glassdoor's own JavaScript. Every path to
+    // those three fields used to carry the whole page: DOMParser walked all of it here, and the tab
+    // fallback structure-cloned all of it twice on the way.
+    //
+    // DOMParser is the part that matters. A content script has no worker to hand it to, so the
+    // parses run on the same main thread as the crawl and do not overlap each other at all: past
+    // about four requests in flight, parsing rather than the network is what the detail phase
+    // spends its time on, and raising "parallel" made it slower instead of faster.
+    //
+    // Two markers, deliberately different. The loose one is exactly what readOverview keys off, so
+    // "not in the page" here means the same thing as "no overview" there and can be answered
+    // without parsing anything. The tight one is what the CUT is placed around, and it insists on
+    // being inside a class attribute - the same hashed names appear in the page's inline CSS, and
+    // a cut around the stylesheet contains no markup at all.
+    //---------------------------------------------------
+
+    // for the tab fallback: which elements are worth sending back instead of the document
+    const OVERVIEW_SELECTORS=['[class*="overviewItem" i]','[class*="companyOverview" i]'];
+
+    const OVERVIEW_ANY=/overviewItem|company overview/i;
+    const OVERVIEW_MARKUP=/class="[^"]{0,300}overviewItem/i;
+
+    // how much of the page around the marker is kept. Generous: the three items are siblings in
+    // every layout seen, and being slightly wrong here costs a re-parse, not a row.
+    const SLICE_BEFORE=4000;
+    const SLICE_AFTER=40000;
+
+    // ...and how far either end may be nudged to land on a tag boundary. Bounded, because the
+    // nearest "<" going backwards can be most of a megabyte away - that is exactly what the JSON
+    // blob this is trying to avoid looks like from the inside, one long run of text with no tags
+    // in it. Unbounded, the search for a tidy boundary walked to the front of the script and the
+    // "cut" came back as the whole page: all of the cost, none of the saving.
+    const SLICE_BOUNDARY=500;
+
+    function sliceOverview(html){
+
+        // nothing any of the three layouts keys off is in this page: it has been read, and it
+        // carries no overview. That is not a refusal, so it must not go round the retry ladder.
+        if(!OVERVIEW_ANY.test(html)) return null;
+
+        const at=html.search(OVERVIEW_MARKUP);
+
+        // the block is in there under a shape this does not recognise -> "" asks for the whole
+        // page to be parsed, exactly as it always was
+        if(at<0) return "";
+
+        // Both ends prefer a tag boundary - DOMParser recovers from most things, but a fragment
+        // that begins halfway through an attribute is not one of them - and settle for the plain
+        // offset when the nearest boundary is further away than SLICE_BOUNDARY. Text that starts
+        // mid-word is just text; a cut the size of the page is the thing to avoid.
+        const wantFrom=Math.max(0,at-SLICE_BEFORE);
+        const wantTo=Math.min(html.length,at+SLICE_AFTER);
+
+        const back=html.lastIndexOf("<",wantFrom);
+        const forward=html.indexOf(">",wantTo);
+
+        const from=back>=0&&wantFrom-back<=SLICE_BOUNDARY?back:wantFrom;
+        const to=forward>=0&&forward-wantTo<=SLICE_BOUNDARY?forward+1:wantTo;
+
+        return html.slice(from,to);
+
+    }
+
+    // did the cut land on the block, or on the words "company overview" in a job description?
+    function hasOverview(doc){
+        return Object.keys(overviewOf(doc)).length>0;
+    }
+
     const SAMESITE_PROBE=4;
 
     const sameSite={
@@ -166,7 +238,11 @@
 
     // The pace floor is zero: a fixed 150ms toll was paid on every company page whether or not
     // Glassdoor minded. The gate widens it the moment anything is actually refused.
-    const gate=core.makeGate({minGap:0,limit:6,log:LOG});
+    //
+    // minLimit is what keeps "parallel" meaning something. Every refusal used to take a slot out
+    // of the pool and only every third clean page gave one back, so the detail phase settled at
+    // one request at a time within a minute of starting and stayed there - see core.makeGate.
+    const gate=core.makeGate({minGap:0,limit:6,minLimit:3,log:LOG});
 
     //---------------------------------------------------
     // One HTTP request, from whichever side is allowed to make it.
@@ -234,6 +310,29 @@
 
         },
 
+        // A 403 on a CROSS-SITE read is the service worker's request carrying none of the page's
+        // cookies. It is not this crawler's pace, and it has never once cleared by waiting - the
+        // same URL opened in a tab comes back straight away.
+        //
+        // Letting it fall through to the refusal branch cost the run twice over: every one of them
+        // parked EVERY worker for up to thirty seconds and took a slot out of the pool, and the
+        // detail phase of a .com search hits it on nearly every company (that is what the
+        // WORKER_GIVE_UP counter below is already counting). "stop" ends this URL's ladder without
+        // charging the pool for it; the tab fallback still picks it up, because the 403 has already
+        // been recorded as this URL's last answer.
+        inspect:(response,url)=>{
+
+            if(response.status!==403) return;
+
+            try{
+                if(new URL(url).origin!==ORIGIN) return "stop";
+            }
+            catch(e){
+                // an unparseable URL is not the case this is here for
+            }
+
+        },
+
         // Two refusals in a row are answered by a real navigation, not by the rest of the ladder -
         // but only while there is a tab left to open. See core.makeFetcher.
         canEscalate:()=>tabs.available
@@ -247,6 +346,18 @@
         log:LOG,
         report,
         lastStatus:fetcher.lastStatus,
+
+        // A Glassdoor job page is well over a megabyte, almost all of it the page's own JSON, and
+        // three fields are read out of it. Asking for the overview block alone means that megabyte
+        // is not cloned across the tab boundary twice and not handed to DOMParser at the end of it.
+        extract:OVERVIEW_SELECTORS,
+
+        // The tab path is the whole crawl once the fetches are being refused, and it used to be one
+        // tab at a time. Now it is a pool - set to the same "parallel" the fetches use, see below -
+        // so the page budget buys several times the pages per minute it used to.
+        budget:250,
+
+
         describe:url=>{
 
             try{
@@ -311,6 +422,15 @@
         // the setting is the ceiling, not a fixed width: the gate drops below it while refused
         gate.limit=concurrency;
         gate.maxLimit=concurrency;
+
+        // ...but never below half of it. A refusal is worth narrowing for; it is not worth going
+        // serial for, because what actually rescues those pages is a tab, and tabs are per-page.
+        gate.minLimit=Math.max(1,Math.ceil(concurrency/2));
+
+        // The same width on the tab side. This is the one that decides whether a run whose fetches
+        // are all refused is parallel at all: past that point every page is a tab, and the tab
+        // worker used to open exactly one at a time whatever this said.
+        tabs.setLimit(concurrency);
 
         //---------------------------------------------------
         // 1b. pick up an unfinished run on the same search
@@ -395,7 +515,15 @@
             // a copy of this listing on the local domain is only worth having if it actually
             // carries the overview - that block is the entire reason for the request
             const doc=company.jobUrl
-                ?await fetchDoc(company.jobUrl,{accept:page=>Object.keys(overviewOf(page)).length>0})
+                ?await fetchDoc(company.jobUrl,{
+                    accept:hasOverview,
+
+                    // parse the overview block, not the megabyte of JSON around it - see
+                    // sliceOverview. `sliced` is the check that the cut landed on the real block;
+                    // when it did not, the whole page is parsed as before and nothing is lost.
+                    slice:sliceOverview,
+                    sliced:hasOverview
+                })
                 :null;
 
             if(!doc){

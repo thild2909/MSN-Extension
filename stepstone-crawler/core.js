@@ -120,6 +120,14 @@ window.CrawlerCore = (function(){
             maxGap:8000,
             maxCooldown:30000,
             limit:4,
+
+            // The narrowest the pool may get while being refused. It used to be 1, unwritten: every
+            // new refusal took a slot away and only every third clean answer gave one back, so a
+            // bad minute in the middle of a run left the rest of it running one request at a time
+            // whatever the caller asked for. Refusals are worth answering by narrowing - they are
+            // not worth answering by going serial, because the fallback that actually rescues those
+            // pages is per-page and does not care how many are in flight.
+            minLimit:1,
             // how much cooling off is worth sitting through before the session is written off
             budget:180000,
             log:console
@@ -139,6 +147,7 @@ window.CrawlerCore = (function(){
 
             limit:o.limit,
             maxLimit:o.limit,
+            minLimit:Math.max(1,Math.min(o.minLimit,o.limit)),
             active:0,
             waiting:[],
 
@@ -246,7 +255,7 @@ window.CrawlerCore = (function(){
                 // times: parallel 6 collapsed to 1 on a single bad page, and since relax() only
                 // widens once per three clean answers it took fifteen good pages to undo. Exactly
                 // the multiplication the comment above says must not happen, on the other lever.
-                if(widen&&this.limit>1) this.limit--;
+                if(widen&&this.limit>this.minLimit) this.limit--;
 
                 // every cooldown since the last request that actually came back
                 this.paidOut+=cool;
@@ -286,6 +295,25 @@ window.CrawlerCore = (function(){
                 this.deadEnds=0;
                 this.paidOut=0;
 
+                // The width comes back on EVERY clean answer, not every third.
+                //
+                // The two levers are not symmetric and were being treated as if they were. The gap
+                // is a claim about the site ("asking this fast is too fast") and it is worth
+                // walking back carefully. The width is a claim about this browser ("six at once is
+                // too many"), and while it is wrong the crawler is idle - five sixths idle, at a
+                // point in the run where nothing is being refused at all. It also took a slot away
+                // per refusal and gave one back per three clean pages, so a handful of refusals
+                // cost fifteen good pages to undo and a run could simply never get back to width.
+                if(this.limit<this.maxLimit){
+
+                    this.limit++;
+
+                    const waking=this.waiting.shift();
+
+                    if(waking) waking();
+
+                }
+
                 // A clean run walks the penalty back down. Shedding it slowly means one bad moment
                 // at page 48 taxes every page after it; the penalty should last as long as the site
                 // is actually pushing back, not for the rest of the run.
@@ -300,16 +328,6 @@ window.CrawlerCore = (function(){
                 // the REST of the run paying a toll earned by one bad moment at page 4. Once the
                 // remainder is down to noise, snap it to the floor and be done with the penalty.
                 if(this.gap-this.minGap<100) this.gap=this.minGap;
-
-                if(this.limit<this.maxLimit){
-
-                    this.limit++;
-
-                    const next=this.waiting.shift();
-
-                    if(next) next();
-
-                }
 
             },
 
@@ -343,6 +361,20 @@ window.CrawlerCore = (function(){
             // actually down, six tries per URL turns a stalled run into a very long stalled run
             maxTransport:3,
             transportPause:700,
+
+            // ...and how many URLs may exhaust their transport retries BACK TO BACK, with nothing
+            // answering in between, before the session is written off.
+            //
+            // maxTransport bounds one URL. Nothing bounded the run: a proxy that mangles HTTP/2
+            // fails every request identically, so 644 job pages each burned three fetches and two
+            // pauses to arrive at the same "connection dropped", took the tab fallback down with
+            // them, and finished with an empty file - twenty minutes to learn something the first
+            // ten URLs had already said.
+            //
+            // Ten in a row with not one answer in between is not a bad patch of network; a bad
+            // patch lets something through. It is generous on purpose - the counter is reset by a
+            // single response, of any status, so a run that is working at all never approaches it.
+            maxTransportStreak:10,
             credentials:"include",
             // A bare fetch() sends "Accept: */*" and no referrer, which reads as an API client.
             // Asking for html from the page we are already on looks like an ordinary page load.
@@ -375,6 +407,11 @@ window.CrawlerCore = (function(){
         // navigation usually answers differently - from a 404, which it answers exactly the same
         // way, only several seconds slower.
         const answers=new Map();
+
+        // URLs that have given up at the transport layer since the last one that got an answer.
+        // Reset by ANY response, whatever its status: a 403 still proves the connection works, and
+        // the thing being detected here is a connection that does not. See maxTransportStreak.
+        let transportStreak=0;
 
         function note(reason){
 
@@ -476,11 +513,31 @@ window.CrawlerCore = (function(){
 
                     }
 
+                    // this URL never got a connection at all. If enough of them in a row have not,
+                    // there is nothing left for the rest of the run to succeed at.
+                    transportStreak++;
+
+                    if(transportStreak>=o.maxTransportStreak&&!gate.dead){
+
+                        gate.dead=true;
+
+                        note("connection is down");
+
+                        console.error(o.log,`${transportStreak} URLs in a row failed to connect at `
+                            +"all - giving up on the rest of this run rather than repeating it "
+                            +"hundreds more times. This is the network in front of the browser (a "
+                            +"VPN or proxy), not the site.",e&&e.message||e);
+
+                    }
+
                     return null;
 
                 }
 
                 const status=response.status;
+
+                // something answered, so whatever the last few URLs did, the connection is alive
+                transportStreak=0;
 
                 answers.set(url,status);
 
@@ -591,6 +648,40 @@ window.CrawlerCore = (function(){
                 // tab fallback on its way to the same answer.
                 if(settings.needs&&!settings.needs.test(html)) return emptyDoc();
 
+                // `slice` is the same idea taken one step further: cut the page down to the part
+                // the caller reads and parse a few KB instead of the whole document.
+                //
+                // This is not a micro-optimisation at any width. DOMParser runs on the SAME main
+                // thread as the crawl - a content script has no worker to hand it to - so at
+                // parallel 6 the parses do not overlap with each other at all, they queue. A job
+                // page is often more than a megabyte, nearly all of it a JSON blob for the page's
+                // own JavaScript, and three fields are read out of it. Past about four in flight
+                // the parse, not the network, is what the detail phase spends its time on, and
+                // adding width made it slower rather than faster.
+                //
+                // null from `slice` means the marker is nowhere in the page: it has been READ and
+                // does not carry what the caller wants, which is not a refusal, so it comes back
+                // as an empty document rather than going round the retry ladder to the same answer.
+                //
+                // `sliced` is the check that the cut actually landed - the words being looked for
+                // turn up in job descriptions too. A cut that missed costs one small wasted parse
+                // and then the whole page is parsed as before, so the fast path can never lose data.
+                if(settings.slice){
+
+                    const cut=settings.slice(html);
+
+                    if(cut===null) return emptyDoc();
+
+                    if(cut){
+
+                        const doc=new DOMParser().parseFromString(cut,"text/html");
+
+                        if(!settings.sliced||settings.sliced(doc)) return doc;
+
+                    }
+
+                }
+
                 return new DOMParser().parseFromString(html,"text/html");
 
             }
@@ -638,6 +729,15 @@ window.CrawlerCore = (function(){
             const parts=Object.keys(stats.byReason)
                 .sort((a,b)=>stats.byReason[b]-stats.byReason[a])
                 .map(reason=>`${stats.byReason[reason]}x ${reason}`);
+
+            // A run cut short is the one thing a request breakdown must not leave the reader to
+            // infer from the numbers - "0 with employee count" reads like the site has none.
+            if(stats.byReason["connection is down"]){
+
+                parts.push("the run was stopped early: nothing was reachable any more, which is the "
+                    +"network or VPN in front of the browser rather than the site");
+
+            }
 
             return parts.length?parts.join(", "):"";
 
@@ -991,9 +1091,21 @@ window.CrawlerCore = (function(){
 
         const o=Object.assign({
 
-            // How much of a refused run is worth rescuing this way. A tab load is a few seconds
-            // and they cannot run in parallel, so this is a time budget as much as a page budget.
+            // How much of a refused run is worth rescuing this way. A tab load is a few seconds,
+            // so this is a time budget as much as a page budget - divided, now, by however many
+            // tabs the worker runs at once (see tabLimit).
             budget:80,
+
+            // How many tabs the worker may keep open at once, and the only knob that decides
+            // whether a fully-refused run is parallel at all: once every page needs a tab, this
+            // IS the crawl's width. Left at 0 the worker keeps its own default.
+            tabLimit:0,
+
+            // CSS selectors naming the part of the page the caller actually reads. The worker
+            // sends back just that markup instead of a document that is mostly someone else's
+            // JSON - across the tab boundary twice and then through DOMParser. Nothing matching
+            // is not an error: the page comes back whole, as it did before.
+            extract:null,
 
             // How many pages in a row must have needed a tab before the cheap path stops being
             // tried first. Past that the retry ladder in front of every page is pure delay,
@@ -1008,6 +1120,21 @@ window.CrawlerCore = (function(){
             // steals focus is expensive to them, so this is deliberately small: one solved
             // challenge sets a cookie for the whole site and the cheap path works again.
             askLimit:2,
+
+            // How many tabs may fail IN A ROW before the fallback accepts that it is not the
+            // answer to whatever is going on.
+            //
+            // The fallback exists because a real navigation succeeds where a fetch is refused. When
+            // the navigation fails too - and fails the same way - that premise is gone: the problem
+            // is underneath both of them, in the connection. A VPN mangling HTTP/2 does exactly
+            // this, and the run it was seen on opened eighty tabs, wasted a real Chrome tab and
+            // several seconds on each, rescued nothing, and printed the same line eighty times.
+            //
+            // `failed` was already counted; nothing ever read it. Only a `fatal` reply (no worker
+            // at all) could switch the fallback off, and "every navigation dies at the transport
+            // layer" is not fatal in that sense - so the budget was the only brake, which is to say
+            // there was none.
+            giveUpAfter:5,
 
             // told the outcome, so the caller can react (a sign-in wall is not a bot check)
             inspect:null,
@@ -1089,6 +1216,16 @@ window.CrawlerCore = (function(){
             asked:0,
             streak:0,
 
+            // tabs that have failed since the last one that worked - see giveUpAfter
+            misses:0,
+
+            // what the tabs were failing with when it gave up, so the summary can say which
+            lastError:"",
+
+            // ...and whether they were failing because the SITE was still asking, which is a
+            // different problem with a different answer from a connection that is not connecting
+            lastChallenged:false,
+
             // "" while usable, otherwise why it stopped - the summary has to be able to say which
             off:"",
 
@@ -1115,9 +1252,74 @@ window.CrawlerCore = (function(){
 
                 }
 
+                // Two ways for every tab to fail, and they want opposite things from the person, so
+                // do not blur them into one message. A run stopped for the wrong reason sends
+                // somebody to reconfigure a VPN that was never the problem.
+                if(reason==="failing"){
+
+                    if(this.lastChallenged){
+
+                        o.report(`${o.giveUpAfter} tabs in a row came back still showing the site's `
+                            +"check, so reopening pages is not getting past it. Open the site in a "
+                            +"normal tab, clear the check by hand, then run again. No more tabs "
+                            +"will be opened; the run will finish with what it already has.");
+
+                        return;
+
+                    }
+
+                    // Not the site, and not this extension: a real top-level navigation carries the
+                    // whole browser and still could not reach the page. Say that outright, because
+                    // the thing to change is outside the crawler - the VPN, the proxy, the network
+                    // - and a person watching eighty identical "reopening in a tab" lines has no
+                    // way to tell.
+                    o.report(`${o.giveUpAfter} tabs in a row failed to load`
+                        +(this.lastError?` (${this.lastError})`:"")
+                        +". Opening the page as a real navigation fails the same way the plain "
+                        +"requests do, so the connection itself is the problem - a VPN or proxy in "
+                        +"front of the browser, or the network. No more tabs will be opened; the "
+                        +"run will finish with what it already has.");
+
+                    return;
+
+                }
+
                 o.report("The tab fallback cannot reach this extension's background worker, so "
                     +"refused pages can no longer be reopened. Open chrome://extensions, reload "
                     +"the extension, and run again.");
+
+            },
+
+            // How wide the tab worker may run. Set from the crawl's own "parallel" setting, which
+            // is only known once the settings have been read - after this object is built.
+            setLimit(limit){
+                o.tabLimit=Math.max(1,Math.round(+limit||0))||o.tabLimit;
+            },
+
+            // How many pages this run may rescue. Sized from the crawl's own work list, which -
+            // like the width above - is only known after this object is built.
+            //
+            // The default is a flat 80, and on a search where EVERY detail page is refused that
+            // number is the whole export. A 855 company run did exactly that: eight refused
+            // requests tripped the caller's breaker, so from then on nothing was fetched at all
+            // and every company needed a tab - the first 80 got one and the remaining 775 got
+            // neither a request nor a tab. They reached the file as blank columns, and from the
+            // console the run simply stopped opening tabs with no line saying why.
+            //
+            // A budget is still worth having, because a tab load is seconds. It just has to be a
+            // budget for THIS run's work rather than a constant that suits a small one.
+            setBudget(pages){
+
+                const wanted=Math.max(1,Math.round(+pages||0));
+
+                if(!pages||wanted===o.budget) return;
+
+                o.budget=wanted;
+
+                // A budget raised after the old one ran out re-opens the fallback: that stop was
+                // about the number, and the number has just changed. Without this the order of
+                // the two calls decides whether the rest of the run can be rescued at all.
+                if(this.off==="budget"&&this.used<wanted) this.off="";
 
             },
 
@@ -1212,7 +1414,8 @@ window.CrawlerCore = (function(){
 
                 o.report(`Refused - reopening ${o.describe(url)} in a tab (${this.used}/${o.budget})`);
 
-                const reply=await wake({type:"tab:fetch",url,letUserSolve});
+                const reply=await wake({type:"tab:fetch",url,letUserSolve,
+                    limit:o.tabLimit,extract:o.extract});
 
                 // the page loaded without needing anyone, so hand the claim back rather than
                 // spending a run's whole interruption budget on tabs that never interrupted
@@ -1221,12 +1424,19 @@ window.CrawlerCore = (function(){
                 if(!reply||!reply.ok){
 
                     this.failed++;
+                    this.misses++;
+                    this.lastError=reply&&reply.error||"no reply from the worker";
+                    this.lastChallenged=!!(reply&&reply.challenged);
 
-                    console.warn(o.log,"tab fallback failed:",reply&&reply.error||"no reply from the worker");
+                    console.warn(o.log,"tab fallback failed:",this.lastError);
 
                     // no worker, or tabs cannot be opened at all: every later attempt fails the
                     // same way, and each one costs a wasted round trip
                     if(!reply||reply.fatal) this.stop("broken");
+
+                    // ...and neither is this one coming back. Every tab since the last success has
+                    // died, so the next eighty will too - stop paying a tab load each to find out.
+                    else if(this.misses>=o.giveUpAfter) this.stop("failing");
 
                     else if(reply.challenged&&reply.askedUser){
 
@@ -1242,6 +1452,9 @@ window.CrawlerCore = (function(){
 
                 this.ok++;
                 this.streak++;
+
+                // a tab that worked says the path is alive, whatever the last few did
+                this.misses=0;
 
                 if(reply.solvedByUser){
 
@@ -1286,7 +1499,13 @@ window.CrawlerCore = (function(){
                     +(this.solved?`, ${this.solved} after you cleared a check`:"")
                     +(this.failed?`, ${this.failed} failed`:"")
                     +(this.off==="budget"?" - budget spent":"")
-                    +(this.off==="broken"?" - the tab worker never answered":"");
+                    +(this.off==="broken"?" - the tab worker never answered":"")
+                    +(this.off==="failing"?` - stopped after ${o.giveUpAfter} in a row `
+                        +(this.lastChallenged
+                            ? "came back still showing the site's check"
+                            : `failed to load`
+                              +(this.lastError?` (${this.lastError})`:"")
+                              +", which is the connection rather than the site"):"");
 
             }
 
@@ -1297,6 +1516,8 @@ window.CrawlerCore = (function(){
     // Read a page the cheap way, and only if that is refused, the way a person would.
     async function tabFirst(fetcher,tabs,url,opts){
 
+        let openedOne=false;
+
         // Every recent page has needed a tab, so the ladder in front of this one would only be
         // delay. The gate is not consulted here: once it writes the session off, fetchDoc returns
         // immediately, which is already the fast path we want.
@@ -1305,6 +1526,8 @@ window.CrawlerCore = (function(){
             const early=await tabs.fetchDoc(url);
 
             if(early) return early;
+
+            openedOne=true;
 
         }
 
@@ -1317,6 +1540,11 @@ window.CrawlerCore = (function(){
             return doc;
 
         }
+
+        // This URL has already been through a real navigation and could not be read. A second
+        // identical one costs another few seconds and another page of the budget to fail the same
+        // way - and on a run where every page needs a tab, it halves how far the budget reaches.
+        if(openedOne) return null;
 
         // refused, dead connection, or the gate gave up on fetches altogether. A real navigation
         // is a different proposition entirely.

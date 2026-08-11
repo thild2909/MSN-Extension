@@ -33,6 +33,10 @@ function fakeEl(depth){
             if(name==="data-sol-meta") return JSON.stringify({pageSize:20,pageNumber:1,totalJobCount:60});
             if(name==="aria-label") return "Go to page 2";
             if(name==="data-jk"||name==="data-job-id"||name==="data-jobid") return "job"+(depth||0);
+            // Dice identifies a card by data-id / data-job-guid. Without them every card was
+            // dropped, the crawler reported "No job cards found" and returned - so its grouping
+            // and its whole export path went unrun here, which is exactly what this file is for.
+            if(name==="data-id"||name==="data-job-guid") return "job"+(depth||0);
             if(name==="id") return "job-item-123";
             if(name==="title") return "Software Engineer";
             if(name==="data-testid") return "pagination-button--0";
@@ -204,8 +208,8 @@ let failed=0;
 // exactly how the Indeed copy drifted into its own generation of the fetcher. Check it here, where
 // it costs nothing, rather than finding out from a crawl.
 //
-// tabs.js is only expected where the crawler makes HTTP requests at all: ctgoodjobs drives the
-// live tab and never fetches, so there is no refusal for a tab to recover from.
+// tabs.js is only expected where a worker is declared - hasWorker(dir) below, not a hard-coded
+// list, so a crawler that grows one (ctgoodjobs did, for its paginator) is covered without an edit.
 (function checkSharedCopies(){
 
     for(const file of ["core.js","tabs.js"]){
