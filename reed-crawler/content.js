@@ -73,6 +73,20 @@
 
     const HARD_PAGE_CAP=200;
 
+    // <div data-qa="badges-container"><span data-qa="badge-0-promoted">Promoted</span></div>
+    //
+    // A promoted slot is an ad the recruiter paid to have shown, and Reed shows THE SAME ONES on
+    // every page - they sit outside the 25 organic results and are not in the result count. They
+    // are already in the file under their ordinary listing, so all they do is arrive again on
+    // every page and look like something going wrong: a 27 page run read 721 cards for 667 ads,
+    // and 54 of the 80 duplicates - two per page, every page - were these.
+    const PROMOTED='[data-qa*="promoted" i]';
+
+    // how many times the second pass may sweep the list looking for the ads the walk was never
+    // served. Declared up here with the other constants on purpose: `const` is in the temporal
+    // dead zone until its own line runs, and recoverGap is called from the main flow above.
+    const RECOVERY_ROUNDS=2;
+
     // The paginator is Bootstrap markup with no data-qa on it at all:
     //   <a href="...&pageno=2" class="page-link next" aria-label="Next page">
     // Matching on ?pageno= is what makes this safe rather than the class name, which is one build
@@ -225,6 +239,29 @@
     let resumed=0;
     let rewound=0;
 
+    // Where the difference between Reed's own job count and the file actually goes. A bare
+    // "22 NOT READ" is not a finding, it is a question - these four are the answer to it.
+    // seenCards = every card scanned; of those, sameAdTwice were an ad already read on another
+    // page (Reed's list shifts as new ads are posted, so ads slide from one page onto the next),
+    // reReads were a page deliberately read twice (the rewind, a resumed run), and noOwnId had no
+    // id attribute of their own.
+    let seenCards=0;
+    let sameAdTwice=0;
+    let reReads=0;
+    let noOwnId=0;
+
+    // promoted slots arriving again on a later page, and duplicates seen during the second pass.
+    // Both are expected and neither costs anything, so they are kept out of sameAdTwice - that
+    // number is the one worth acting on and it must not be buried under the other two.
+    let promotedRepeats=0;
+    let recoveryRepeats=0;
+
+    // pages the crawler counted its way to because no "Next" link was found on the page before.
+    // Counted separately from the `counted` Set, which also holds the URLs guessed past a page
+    // that never arrived - reporting the Set made a run that stepped over two dead pages claim
+    // Reed's paginator had gone missing on two more pages than it had.
+    let countedForward=0;
+
     // profile lookups abandoned once the sample said they were not paying for themselves
     let droppedLookups=0;
     let probed=0;
@@ -323,6 +360,14 @@
 
         }
 
+        // The walk read every page in order and still came up short, because the list moved while
+        // it was reading. Asking again is the only thing that gets those ads.
+        const recovery=await recoverGap(total,paging,concurrency);
+
+        if(recovery.found){
+            console.log(LOG,`second pass recovered ${recovery.found} ad(s) over ${recovery.pages} page(s)`);
+        }
+
         //---------------------------------------------------
         // 3. group by company
         //---------------------------------------------------
@@ -400,7 +445,7 @@
         // 5. export to excel + trigger the download
         //---------------------------------------------------
 
-        finish({companies,total,paging,targets:targets.length,wantProfiles,withSize,failed,crashed:null});
+        finish({companies,total,paging,recovery,targets:targets.length,wantProfiles,withSize,failed,crashed:null});
 
     }
     catch(e){
@@ -471,6 +516,53 @@
 
         const paging=state.paging||{pages:0,failed:0,recovered:0,counted:0,reason:"end"};
 
+        // Reed's own count against what is in the file, and what stands between them. Every ad
+        // Reed counts is either in the file, or it is one of these - and a run that cannot say
+        // which is a run nobody can act on. The last line is the honest remainder: a search whose
+        // ads are being posted while it is read has more of them at the end than at the start,
+        // and no amount of paging catches up with that.
+        const missing=state.total?Math.max(0,state.total-jobs.length):0;
+
+        const unread=paging.failed*PAGE_SIZE;
+
+        const unaccounted=Math.max(0,missing-sameAdTwice-unread);
+
+        const rescue=state.recovery||{pages:0,found:0,rounds:0};
+
+        const ledger=!missing&&seenCards<=jobs.length?"":[
+            // the crash path has no total to reconcile against - it still has cards to account for
+            state.total
+                ? `Reed counts ${state.total} ad(s) and the file holds ${jobs.length}. Of the `
+                    +`${seenCards} card(s) read over ${paging.pages} page(s)`
+                    +(rescue.pages?` plus ${rescue.pages} re-read on the second pass`:"")+":"
+                : `${jobs.length} ad(s) in the file, from ${seenCards} card(s) read over `
+                    +`${paging.pages} page(s):`,
+            // First, and named for what it is, because it is nearly always the biggest number here
+            // and it is the one that means nothing at all.
+            promotedRepeats?`  - ${promotedRepeats} card(s) were Promoted slots. Reed shows the `
+                +"same paid ads on every page and does not count them in the total, so they arrive "
+                +"again with each page. Every one of them is already in the file under its "
+                +"ordinary listing - nothing is missing because of these.":"",
+            sameAdTwice?`  - ${sameAdTwice} card(s) repeated an ad already read on an earlier page. `
+                +"This is the one that costs coverage: Reed's list does not hold still between "
+                +"requests, so when it moves the top of a page repeats the bottom of the last one "
+                +"and whatever was pushed off the top is served to nobody."
+                +(rescue.found?` The second pass went back for those and found ${rescue.found}.`
+                    :rescue.pages?" The second pass went back for those and found none.":""):"",
+            reReads?`  - ${reReads} card(s) came off a page that was deliberately read twice (the `
+                +"rewind to page 1, or a resumed run). Nothing is lost to those.":"",
+            recoveryRepeats?`  - ${recoveryRepeats} card(s) were seen again on the second pass, `
+                +"which is what a second pass mostly reads. Nothing is lost to those either.":"",
+            noOwnId?`  - ${noOwnId} card(s) carried no job id of their own and were identified by `
+                +"what the card says. Those ARE in the file - but if that number is large, Reed "
+                +"has renamed the id attribute and the grouping is weaker than it looks.":"",
+            unread?`  - up to ${unread} more sat on the ${paging.failed} page(s) that never `
+                +"arrived. Those really are missing.":"",
+            unaccounted?`  - ${unaccounted} are still missing after all of that. Reed's count is `
+                +"live: ads posted while the run was going are counted in the total and sit at the "
+                +"top of page 1, so a search this size never quite closes.":""
+        ].filter(Boolean).join("\n");
+
         // "Done" on its own reads as "that was all of it", which is exactly wrong when the walk
         // was cut short - the file then looks complete while half the list is missing.
         const problems=[
@@ -506,6 +598,7 @@
             +`, ${state.failed} request errors.`
             +(resumed?`\nResumed ${resumed} job(s) from an earlier unfinished run.`:"")
             +(core.describeSizes(state.companies)?`\n${core.describeSizes(state.companies)}`:"")
+            +(ledger?"\n\n"+ledger:"")
             +(problems.length?"\n\n"+problems.join("\n"):"")
             +(fetcher.describe()?`\nRequests: ${fetcher.describe()}`:"")
             +(tabs.describe()?`\n${tabs.describe()}`:"")
@@ -625,8 +718,12 @@
         // silently drops every earlier page - a tab left on page 5 loses 100 jobs. Rewind to page
         // 1 instead; the ads already in `visited` are deduped on arrival, so the only cost is the
         // requests, not the data.
+        //
+        // The ceiling is asked here too, and for the same reason it is asked in nextOf: a search
+        // that fits on ONE page still renders a "Next" link, and following it off the only page
+        // there is turns a complete run into one that reports a 404 it had no business asking for.
         const start=here>1?pageUrl(1)
-            :nextUrl(document,location.href)||(moreAfter(here)?stepPage(location.href):"");
+            :moreAfter(here)?(nextUrl(document,location.href)||stepPage(location.href)):"";
 
         rewound=here>1?here-1:0;
 
@@ -677,15 +774,25 @@
             // ?pageno= counter and the first page with no cards ends the walk.
             nextOf:(doc,url)=>{
 
+                const page=core.paramOf(url,PAGE_PARAM,ORIGIN)||1;
+
+                // The result count is asked FIRST, before the paginator is even looked at, and
+                // that order is the whole point. Reed renders "Next" on the last page too - a
+                // real <a href="...&pageno=28"> on the last page of 27 - and following it asks
+                // for a page that does not exist. Reed answers 404, the walk counts forward to
+                // 29 and 30 for two more, calls three failures in a row a refusal and stops. The
+                // run then reports two pages lost and results refused, having in fact read every
+                // page there was. Where the list ends is a fact about the count, not about what
+                // the paginator chose to draw.
+                if(!moreAfter(page)) return "";
+
                 const found=nextUrl(doc,url);
 
                 if(found) return found;
 
-                const page=core.paramOf(url,PAGE_PARAM,ORIGIN)||1;
-
-                if(!moreAfter(page)) return "";
-
                 console.warn(LOG,`no "Next" link on page ${page} - counting forward instead`);
+
+                countedForward++;
 
                 return stepPage(url);
 
@@ -693,7 +800,17 @@
 
             // The next URL normally comes out of the page we just failed to read, so without this
             // one bad moment at page 27 of 140 throws away four fifths of the list.
-            guessNext:url=>stepPage(url),
+            guessNext:url=>{
+
+                const page=core.paramOf(url,PAGE_PARAM,ORIGIN)||1;
+
+                // ...but a page at or past the end of the list did not fail, it does not exist,
+                // and stepping further forward only collects more 404s to mistake for a block.
+                if(lastPage&&page>=lastPage) return "end";
+
+                return stepPage(url);
+
+            },
 
             maxPages:limit,
             report,
@@ -709,10 +826,86 @@
             pages:walk.pages,
             failed:walk.skipped,
             recovered:walk.recovered,
-            counted:counted.size,
+            counted:countedForward,
             reason:walk.reason,
             stoppedEarly:walk.reason!=="end"
         };
+
+    }
+
+    //---------------------------------------------------
+    // helper: go back for the ads the walk was never served
+    //
+    // A Reed search is one list read 25 rows at a time over half a minute, and the list does not
+    // hold still while that happens. When it moves down between two requests, the top of the next
+    // page repeats the bottom of the last one - and the ads that were pushed off the top of a page
+    // already read are never served to anybody. That is not a bug in the walk and no amount of
+    // care during it helps: the pages were all read, in order, exactly once.
+    //
+    // 26 of 667 went that way on a 13 second run. The only thing that gets them is asking again,
+    // because the second read lands the page boundaries somewhere else - so this re-reads the
+    // pages once the walk is done and keeps whatever is new. Unlike the walk, every URL is known
+    // up front, so it runs at the crawl's full width instead of one page at a time.
+    //
+    // Strictly bounded: it only runs when the walk finished on its own AND Reed's own count says
+    // ads are missing, it stops the moment the count is met, and it gives up after a round that
+    // finds nothing rather than chasing a total that is itself still moving.
+    //---------------------------------------------------
+
+    async function recoverGap(total,paging,concurrency){
+
+        const done={pages:0,found:0,rounds:0};
+
+        // no total to chase, nothing missing, or the walk was cut short - in the last case the
+        // gap is the pages that never arrived, and re-reading the ones that did will not fill it
+        if(!total||jobs.length>=total||paging.reason!=="end") return done;
+
+        const lastPage=Math.min(Math.ceil(total/PAGE_SIZE),HARD_PAGE_CAP);
+
+        if(!lastPage) return done;
+
+        const pages=[];
+
+        for(let page=1;page<=lastPage;page++) pages.push(page);
+
+        for(let round=1;round<=RECOVERY_ROUNDS;round++){
+
+            const before=jobs.length;
+
+            report(`${total-jobs.length} ad(s) Reed counts were never served to the walk - `
+                +`re-reading ${lastPage} page(s) to pick them up...`);
+
+            await core.mapPool(pages,concurrency,async page=>{
+
+                // the count can be met half way through the sweep, and the rest of it is then
+                // pages nobody needs
+                if(jobs.length>=total) return;
+
+                const doc=await fetchDoc(pageUrl(page));
+
+                done.pages++;
+
+                if(!doc) return;
+
+                const got=collectFrom(doc,page,true);
+
+                if(got.added) report(`Second pass, page ${page}: +${got.added} ad(s) the walk `
+                    +`never saw, ${jobs.length} total`);
+
+            },{log:LOG});
+
+            done.rounds=round;
+            done.found+=jobs.length-before;
+
+            await checkpoint.save({jobs},true);
+
+            // met the count, or a whole sweep turned up nothing new: either way there is no
+            // reason to pay for another one
+            if(jobs.length>=total||jobs.length===before) break;
+
+        }
+
+        return done;
 
     }
 
@@ -735,33 +928,39 @@
     // it: the crawler does NOT read the pages in site order (it reads the open page first, then
     // rewinds to page 1), so the order of `jobs` is the order it fetched them. buildCompanies
     // sorts on these to put the sheet back into the order the site shows.
-    function collectFrom(doc,page){
+    function collectFrom(doc,page,recovery){
 
         const cards=doc.querySelectorAll(CARD);
 
         let added=0;
         let dropped=0;
         let elsewhere=0;
+        let again=0;
         let rank=0;
 
         cards.forEach(card=>{
 
             const job=readCard(card,page,rank++);
 
-            if(!job.id){
-                dropped++;
-                return;
-            }
+            if(!job.hasOwnId) dropped++;
 
             if(visited.has(job.id)){
 
+                // Which KIND of duplicate this is, because they mean four different things and
+                // lumping them together is what made a working run look broken. A promoted slot
+                // repeated on every page says nothing at all; an ordinary ad arriving from a
+                // different page says the list moved under the walk, and THAT is the one that
+                // costs coverage.
+                const from=visited.get(job.id);
+
+                if(job.promoted) promotedRepeats++;
+                else if(recovery) recoveryRepeats++;
                 // This ad was read as part of a DIFFERENT page, so this page is a copy of one
                 // already seen rather than a page being re-read on purpose. An unknown page (an
                 // old checkpoint) counts as the same page: erring towards carrying on costs one
                 // wasted request, erring the other way costs the rest of the list.
-                const from=visited.get(job.id);
-
-                if(from&&from!==page) elsewhere++;
+                else if(from&&from!==page) elsewhere++;
+                else again++;
 
                 return;
 
@@ -775,11 +974,21 @@
 
         });
 
-        // a card with no identity used to be skipped in silence, so a build that renamed the id
-        // attribute would empty every page while the run still reported "+0 job(s)" and carried on
+        // Every card that came off a page, counted where the counting can be reconciled against
+        // Reed's own total afterwards. Without this the run could say 22 ads were missing but not
+        // one word about WHERE they went, and "Reed served the same ad on two pages" and "22 ads
+        // were never fetched at all" are not remotely the same fact.
+        seenCards+=cards.length;
+        sameAdTwice+=elsewhere;
+        reReads+=again;
+        noOwnId+=dropped;
+
+        // a card with no identity used to be skipped outright, so the ad was lost over a missing
+        // attribute. It is kept now and keyed by its place in the list - but a build that renamed
+        // the attribute is still worth a line, because that key is weaker than a real one.
         if(dropped){
             console.warn(LOG,`${dropped} of ${cards.length} card(s) on page ${page} had neither an`
-                +" id nor a link and were skipped");
+                +" id nor a link - they were kept and identified by their place in the list");
         }
 
         return {cards:cards.length,added,dropped,elsewhere};
@@ -846,14 +1055,29 @@
 
         const jobUrl=linkHref(title);
 
+        const name=(title&&title.getAttribute("title"))||norm(title)
+            ||norm(card.querySelector('[data-qa="job-title-btn-wrapper"]'));
+
+        // data-id="job57204881" on the article. Reed renames class names per build but not this;
+        // still, the ad's own URL is unique per ad too and that is all `visited` needs.
+        //
+        // What used to happen when BOTH were missing is that the caller threw the whole card away
+        // in silence - an ad was lost over its id attribute, and the summary said only that N jobs
+        // were "NOT READ".
+        //
+        // The last resort is made of what the card SAYS, never of where it sits. Pages here are
+        // re-read on purpose - the rewind to page 1, a resumed run, and every page again on the
+        // second pass - so a key built from the page or the row number would hand one ad a fresh
+        // identity on each reading and write it into the file twice.
+        const own=(card.getAttribute("data-id")||"").replace(/^job/,"")||jobUrl;
+
         return {
-            // data-id="job57204881" on the article. Reed renames class names per build but not
-            // this; still, fall back to the ad's own URL rather than dropping the card - either
-            // one is unique per ad and that is all `visited` needs.
-            id:(card.getAttribute("data-id")||"").replace(/^job/,"")||jobUrl,
+            id:own||"card:"+[name,company.name,meta.location,meta.salary,posted.text].join("|"),
+            hasOwnId:!!own,
+            promoted:!!card.querySelector(PROMOTED),
             page,
             rank,
-            title:(title&&title.getAttribute("title"))||norm(title),
+            title:name,
             company:company.name,
             profileUrl:company.url,
             profileId:profileId(company.url),
@@ -988,14 +1212,22 @@
         // into the order Reed shows.
         const ordered=[...list].sort((a,b)=>(a.page||0)-(b.page||0)||(a.rank||0)-(b.rank||0));
 
+        // Group by profile id; without one, fall back to the folded name rather than the raw one,
+        // so "Best4Business Group" and "Best4Business Group Ltd" do not become two rows each
+        // holding a slice of the positions.
+        //
+        // core.companyKeys is what makes the two agree. The profile id comes off a link, and Reed
+        // writes the recruiter in up to three places with any one of them absent - a card with no
+        // logo and no company-name link has only the plain-text "Posted by" line and no /p<id> at
+        // all. So the same agency arrived as "id:57826" on one ad and "name:matchtech" on the next:
+        // two rows, which is the duplicate the folded name exists to prevent.
+        const keyOf=core.companyKeys(ordered,job=>job.profileId,job=>job.company||"(unknown)");
+
         for(const job of ordered){
 
             const name=job.company||"(unknown)";
 
-            // group by profile id; without one, fall back to the folded name rather than the raw
-            // one, so "Best4Business Group" and "Best4Business Group Ltd" do not become two rows
-            // each holding a slice of the positions
-            const key=job.profileId?"id:"+job.profileId:"name:"+core.nameKey(name);
+            const key=keyOf(job);
 
             job.key=key;
 
@@ -1028,7 +1260,7 @@
 
             company.jobs++;
 
-            push(company.positions,job.title);
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,readMode(job.workFromHome,job.location));
 
@@ -1042,6 +1274,10 @@
             // an ad with no date at all still has to leave SOMETHING in the column when it is the
             // only one this company posted
             if(!company.posted&&job.postedText) company.posted=job.postedText;
+
+            // the row may have been opened by an ad that carried no profile link, so take the id
+            // from whichever of this recruiter's ads did have one
+            if(!company.profileId&&job.profileId) company.profileId=job.profileId;
 
             if(!company.profileUrl&&job.profileUrl) company.profileUrl=job.profileUrl;
 
@@ -1057,6 +1293,21 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per AD, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so an agency running
+    // four separate "Software Developer" ads reached the file as one position and read as though it
+    // were hiring for one. Location and Remote/Onsite keep using push(), because those describe the
+    // company and really are a set: "London, London, London" is noise, three identical job titles
+    // are three jobs - and on Reed, where most ads are posted by agencies, repeated titles under one
+    // recruiter are the normal case rather than an oddity.
+    //
+    // An ad whose title could not be read is still an ad, so it is marked rather than dropped - the
+    // number of entries in the cell always equals the number of ads behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     //---------------------------------------------------

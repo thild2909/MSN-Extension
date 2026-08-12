@@ -952,16 +952,19 @@
         const cards=root.querySelectorAll(CARD);
 
         let added=0;
+        let noOwnId=0;
 
         cards.forEach(card=>{
 
-            const id=card.getAttribute("data-jobid");
+            const job=readCard(card);
 
-            if(!id||visited.has(id)) return;
+            if(!job.hasOwnId) noOwnId++;
 
-            visited.add(id);
+            if(visited.has(job.id)) return;
 
-            jobs.push(readCard(card,id));
+            visited.add(job.id);
+
+            jobs.push(job);
 
             added++;
 
@@ -969,6 +972,15 @@
 
         if(cards.length===0){
             console.warn(LOG,'no [data-test="jobListing"] on this page');
+        }
+
+        // a card with no data-jobid used to be SKIPPED here, so a build that renamed the attribute
+        // emptied the run while it still reported batches and finished normally. It is kept now and
+        // identified by its own listing URL, which is unique per ad and stable across the re-reads
+        // this crawler does on every batch.
+        if(noOwnId){
+            console.warn(LOG,`${noOwnId} of ${cards.length} card(s) had no data-jobid - they were `
+                +"kept and identified by their listing URL");
         }
 
         return {cards:cards.length,added};
@@ -980,7 +992,7 @@
     // Glassdoor hashes its class names per build -> rely only on data-test and id.
     //---------------------------------------------------
 
-    function readCard(card,id){
+    function readCard(card){
 
         const title=card.querySelector('[data-test="job-title"]');
         const location=pick(card,'[data-test="emp-location"]');
@@ -992,15 +1004,31 @@
         const brand=card.getAttribute("data-brandviews")||"";
         const employerId=(brand.match(/eid=(\d+)/)||[])[1]||"";
 
+        const name=norm(title);
+        const company=readCompany(card);
+        const jobUrl=title?absolute(title.getAttribute("href")):"";
+
+        // data-jobid is the listing id. It used to be required, and a card without one was dropped
+        // - the JOB was lost over a missing attribute, on a site that hashes and renames markup per
+        // build. The listing URL is the floor under it: unique per ad, and stable, which matters
+        // more here than anywhere else because this crawler re-reads the WHOLE list on every batch
+        // and only `visited` stops the earlier cards being collected again.
+        //
+        // jlid inside data-brandviews is the same id by another name, so it is tried before the URL.
+        const own=card.getAttribute("data-jobid")
+            ||(brand.match(/jlid=(\d+)/)||[])[1]
+            ||"";
+
         return {
-            id,
+            id:own||jobUrl||`${company}|${name}`,
+            hasOwnId:!!own,
             employerId,
-            title:norm(title),
-            company:readCompany(card),
+            title:name,
+            company,
             location,
             postedText:posted,
             postedAge:age?+age[1]*UNIT[age[2].toLowerCase()]:Infinity,
-            jobUrl:title?absolute(title.getAttribute("href")):""
+            jobUrl
         };
 
     }
@@ -1153,14 +1181,22 @@
 
         const map=new Map();
 
+        // Group by employer id when the card carried one: the same company written two ways
+        // ("Thermo Fisher Scientific" / "Thermo Fisher") still lands on one row. Falling back to the
+        // folded name rather than the raw one keeps "ACME Ltd" and "ACME Ltd." together.
+        //
+        // core.companyKeys is what makes the two agree. The id is parsed out of data-brandviews,
+        // which is an analytics attribute rather than data the page owes anyone - it is absent on
+        // sponsored cards and on any build that stops emitting it - so the same employer arrived as
+        // "id:658" on one card and "name:thermo fisher" on the next: two rows, each with a slice of
+        // the positions, which is the duplicate the folded name exists to prevent.
+        const keyOf=core.companyKeys(list,job=>job.employerId,job=>job.company||"(unknown)");
+
         for(const job of list){
 
             const name=job.company||"(unknown)";
 
-            // group by employer id when the card carried one: the same company written two ways
-            // ("Thermo Fisher Scientific" / "Thermo Fisher") still lands on one row. Falling back
-            // to the folded name rather than the raw one keeps "ACME Ltd" and "ACME Ltd." together.
-            const key=job.employerId?"id:"+job.employerId:"name:"+core.nameKey(name);
+            const key=keyOf(job);
 
             let company=map.get(key);
 
@@ -1187,7 +1223,7 @@
 
             company.jobs++;
 
-            push(company.positions,job.title);
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,readMode(job.location));
 
@@ -1198,6 +1234,14 @@
                 company.jobUrl=job.jobUrl;
             }
 
+            // the row may have been opened by a card whose data-brandviews was missing, so take the
+            // id from whichever of this employer's cards did carry one
+            if(!company.employerId&&job.employerId) company.employerId=job.employerId;
+
+            // ...and the overview is read from a job URL, so the row needs one even when the card
+            // that opened it had none
+            if(!company.jobUrl&&job.jobUrl) company.jobUrl=job.jobUrl;
+
         }
 
         // most listings first, then alphabetically on a tie
@@ -1207,6 +1251,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per LISTING, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Software Engineer" listings reached the file as one position and read as though
+    // it were hiring for one. Location and Remote/Onsite keep using push(), because those describe
+    // the company and really are a set: "Singapore, Singapore, Singapore" is noise, three identical
+    // job titles are three jobs.
+    //
+    // A listing whose title could not be read is still a listing, so it is marked rather than
+    // dropped - the number of entries in the cell always equals the number of listings behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     // Glassdoor puts the work location in a single field: "Remote", "Hybrid" or a city name.

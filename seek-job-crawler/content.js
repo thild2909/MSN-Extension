@@ -378,6 +378,11 @@
             // for companies with no SEEK profile, fall back to reading the job page.
             const url=company.profileUrl||company.jobUrl;
 
+            // Neither exists - every one of this company's cards was read without an id, so there
+            // is no page to ask. Returning false rather than null says "read, nothing there": null
+            // would mark it failed and send the retry pass after a URL that does not exist.
+            if(!url) return false;
+
             const doc=await fetchDoc(url,{needs:SIZE_HINT});
 
             if(!doc){
@@ -664,14 +669,21 @@
         const cards=root.querySelectorAll('article[data-testid="job-card"]');
 
         let added=0;
+        let noOwnId=0;
 
         cards.forEach(card=>{
 
-            const id=card.getAttribute("data-job-id");
+            // data-job-id is normally there. When it is not, the ad's own title link still carries
+            // the same id in its path (/job/12345678), and only when neither is readable does the
+            // card fall back to what it says. It used to be dropped outright on a missing attribute,
+            // which lost the JOB over its id.
+            const own=card.getAttribute("data-job-id")||linkJobId(card);
 
-            if(!id) return;
+            if(!own) noOwnId++;
 
-            const job=readCard(card,id);
+            const id=own||cardFingerprint(card);
+
+            const job=readCard(card,id,!!own);
 
             const old=seenJobs.get(id);
 
@@ -702,7 +714,41 @@
             console.warn(LOG,'no article[data-testid="job-card"] on this page');
         }
 
+        if(noOwnId){
+            console.warn(LOG,`${noOwnId} of ${cards.length} card(s) had no job id of their own - `
+                +"they were kept and identified by what the card says");
+        }
+
         return {cards:cards.length,added};
+
+    }
+
+    // /job/86513121?type=standout -> "86513121". The same id data-job-id would have carried, so a
+    // build that stops rendering the attribute costs nothing.
+    function linkJobId(card){
+
+        for(const a of card.querySelectorAll('a[href*="/job/"]')){
+
+            const match=/\/job\/(\d+)/.exec(a.getAttribute("href")||"");
+
+            if(match) return match[1];
+
+        }
+
+        return "";
+
+    }
+
+    // Last resort, and deliberately made of what the card SAYS rather than where it sits: SEEK
+    // pages are fetched in parallel and re-read on a resumed run, so a key built from a page number
+    // or an index would hand the same ad a new identity every time it was seen and duplicate it.
+    function cardFingerprint(card){
+
+        return "card:"+[
+            pick(card,'[data-automation="jobTitle"]'),
+            pick(card,'[data-automation="jobCompany"]'),
+            pick(card,'[data-automation="jobLocation"]')
+        ].join("|");
 
     }
 
@@ -710,7 +756,7 @@
     // helper: read one card
     //---------------------------------------------------
 
-    function readCard(card,id){
+    function readCard(card,id,hasOwnId){
 
         // "(Remote)" -> strip the parentheses
         const arrangement=pick(card,'[data-testid="work-arrangement"]').replace(/^\(|\)$/g,"");
@@ -730,7 +776,10 @@
             listed:listed.text,
             listedAge:listed.age,
             profileUrl:profile?absolute(profile.getAttribute("href")):"",
-            jobUrl:ORIGIN+"/job/"+id
+            // only when `id` really is SEEK's job id. A fingerprinted card has no /job/ URL, and
+            // building one out of the fingerprint would hand the size lookup a guaranteed 404 to
+            // spend a request and a retry pass on.
+            jobUrl:hasOwnId?ORIGIN+"/job/"+id:""
         };
 
     }
@@ -867,7 +916,11 @@
             // only companies with a profile expose a headcount
             if(!company.profileUrl&&job.profileUrl) company.profileUrl=job.profileUrl;
 
-            push(company.positions,job.title);
+            // ...and the job page is the fallback source, so the row needs one even when the card
+            // that opened it had no readable id and therefore no URL
+            if(!company.jobUrl&&job.jobUrl) company.jobUrl=job.jobUrl;
+
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,readMode(job.arrangement));
 
@@ -879,6 +932,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per LISTING, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Software Engineer" listings reached the file as one position and read as though
+    // it were hiring for one. Location and Remote/Onsite keep using push(), because those describe
+    // the company and really are a set: "Sydney, Sydney, Sydney" is noise, three identical job
+    // titles are three jobs.
+    //
+    // A listing whose title could not be read is still a listing, so it is marked rather than
+    // dropped - the number of entries in the cell always equals the number of listings behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     // SEEK writes "Remote" / "Hybrid" / "On-site" -> normalize to Remote/Hybrid/Onsite

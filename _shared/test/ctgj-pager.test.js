@@ -64,6 +64,18 @@ function text(t){
     return el({textContent:t});
 }
 
+// Every way the crawler asks for the job cards on a page.
+//
+// This stub matches selector STRINGS rather than parsing them, so it has to be told when one is
+// rewritten. collectFrom asks for ".job-card" - it must see a card whose data-job-id is missing,
+// rather than have the selector hide it and read the page as empty - while the paginator's own
+// waits still ask for ".job-card[data-job-id]". Both mean "the job cards", so both answer here;
+// pinning the stub to one literal made a legitimate selector change look like a crawler that had
+// stopped finding anything at all.
+function isCardSelector(sel){
+    return sel===".job-card"||sel===".job-card[data-job-id]";
+}
+
 // one .job-card, laid out the way readCard reads it
 function card(page,i){
 
@@ -161,14 +173,14 @@ function docFor(page){
             }
 
             // firstCardId - the other half of what clickPager waits for
-            if(sel===".job-card[data-job-id]") return cardsOf(page)[0]||null;
+            if(isCardSelector(sel)) return cardsOf(page)[0]||null;
 
             if(sel===".no-of-jobs") return text(String(PAGES*PER_PAGE)+" jobs");
 
             return null;
 
         },
-        querySelectorAll:sel=>list(sel===".job-card[data-job-id]"?cardsOf(page):[]),
+        querySelectorAll:sel=>list(isCardSelector(sel)?cardsOf(page):[]),
         createElement:()=>el({}),
         addEventListener(){}
     };

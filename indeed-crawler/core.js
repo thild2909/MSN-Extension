@@ -941,6 +941,13 @@ window.CrawlerCore = (function(){
 
                 const next=o.guessNext?o.guessNext(url):"";
 
+                // "end" is the caller saying this URL is past the end of the list, so it did not
+                // fail - it does not exist. A site that answers a page number past its last page
+                // with a 404 is not refusing anything, but three of those in a row read exactly
+                // like a block: the walk stopped as "blocked", the summary reported pages lost and
+                // results refused, and the run it said that about had read every page there was.
+                if(next==="end") break;
+
                 if(++misses>=o.maxMisses||!next){
                     reason="blocked";
                     break;
@@ -1065,6 +1072,55 @@ window.CrawlerCore = (function(){
         // stripping everything left nothing recognisable ("Ltd." on its own) -> keep the original,
         // because merging every such row into one would be far worse than not merging at all
         return clean||(name||"").toLowerCase().trim();
+
+    }
+
+    //---------------------------------------------------
+    // one grouping key per employer, worked out BEFORE the grouping runs
+    //
+    // Every crawler here keys a company by its profile id when the card carried one and by the
+    // folded name when it did not. That is right per CARD and wrong per COMPANY: whether an id is
+    // rendered is a property of the card, not of the employer, so within one search the same
+    // company arrives with an id on some ads and without on others - a logo link that failed to
+    // render, a sponsored card, a build that renames the attribute halfway down the page. Those
+    // ads then landed on "id:241382" AND on "name:acme": two rows, each holding a slice of the
+    // positions, which is precisely the duplicate the folded name exists to prevent one level up.
+    //
+    // So the ids are read first, and every job of a name that was EVER seen with an id is filed
+    // under that id. A name that never came with one keeps its name key, exactly as before.
+    //
+    //   keyOf = core.companyKeys(jobs, job=>job.employerId, job=>job.company)
+    //   const key = keyOf(job)
+    //---------------------------------------------------
+
+    function companyKeys(list,idOf,nameOf){
+
+        const idByName=new Map();
+
+        for(const item of list||[]){
+
+            const id=idOf(item)||"";
+
+            if(!id) continue;
+
+            const name=nameKey(nameOf(item)||"");
+
+            // The FIRST id wins, and it wins for good. Two employers that fold to one name is far
+            // rarer than one employer whose cards disagree about its id, and picking one
+            // deterministically is what keeps the sheet identical between two runs of the same
+            // search - re-pointing the name at a later id would reorder every row behind it.
+            if(name&&!idByName.has(name)) idByName.set(name,id);
+
+        }
+
+        return function(item){
+
+            const name=nameKey(nameOf(item)||"");
+            const id=idOf(item)||idByName.get(name)||"";
+
+            return id?"id:"+id:"name:"+name;
+
+        };
 
     }
 
@@ -1881,6 +1937,7 @@ window.CrawlerCore = (function(){
         bumpParam,
         paramOf,
         nameKey,
+        companyKeys,
         makeTabFallback,
         tabFirst,
         headcount,

@@ -365,9 +365,13 @@
 
         let withModel=0;
 
+        // modelByCompany is filled in during pagination, keyed by the folded company NAME, because
+        // that is all a card on screen offers readModelsOnPage. The rows are now keyed by employer
+        // id where there is one, so the two keys are no longer the same string - look the model up
+        // by the name the row carries rather than by its key.
         companies.forEach(company=>{
 
-            const model=modelByCompany.get(companyKey({Company:company.name}));
+            const model=modelByCompany.get(company.nameKey);
 
             if(model){
                 push(company.modes,model);
@@ -526,7 +530,7 @@
 
             companies.forEach(company=>{
 
-                const model=modelByCompany.get(companyKey({Company:company.name}));
+                const model=modelByCompany.get(company.nameKey);
 
                 if(model){
                     push(company.modes,model);
@@ -562,16 +566,36 @@
 
     function collectFrom(root){
 
-        const cards=root.querySelectorAll(".job-card[data-job-id]");
+        // ".job-card", not ".job-card[data-job-id]". Requiring the attribute in the SELECTOR meant a
+        // card without it was never even seen: it did not count towards `cards`, so a build that
+        // renamed the attribute looked exactly like an empty page and the emptyStreak guard stopped
+        // the walk two pages later, reporting a complete run. The card is read either way now and
+        // keyed on its listing link when the attribute is missing.
+        const cards=root.querySelectorAll(".job-card");
 
         let added=0;
+        let noOwnId=0;
 
         cards.forEach(card=>{
 
-            const id=card.getAttribute("data-job-id");
+            const title=card.querySelector("a.jc-position");
+            const href=title&&title.getAttribute("href")||"";
+
+            const own=card.getAttribute("data-job-id")||href;
+
+            if(!own) noOwnId++;
+
+            // Last resort made of what the card SAYS, not where it sits: the walk re-reads pages
+            // (the rewind to page 1, a resumed run, a page reopened in a background tab), so a
+            // position-based key would hand one listing a new identity every time and duplicate it.
+            const id=own||("card:"+[
+                pick(card,"a.jc-position h2")||norm(title),
+                norm(card.querySelector("a.jc-company")),
+                pick(card,".jc-info .col-12")
+            ].join("|"));
 
             // Promoted listings can repeat inside the normal list -> dedupe by id
-            if(!id||visited.has(id)) return;
+            if(visited.has(id)) return;
 
             visited.add(id);
 
@@ -583,6 +607,11 @@
 
         if(cards.length===0){
             console.warn(LOG,"no .job-card on this page");
+        }
+
+        if(noOwnId){
+            console.warn(LOG,`${noOwnId} of ${cards.length} card(s) had neither a data-job-id nor a `
+                +"listing link - they were kept and identified by what the card says");
         }
 
         return {cards:cards.length,added};
@@ -648,10 +677,6 @@
     // a closed list of legal-form suffixes - and nothing else, so distinct employers stay apart.
     function nameKey(name){
         return core.nameKey(name);
-    }
-
-    function companyKey(row){
-        return nameKey(row["Company"]);
     }
 
     // The panel's Apply button carries the id of the listing it is currently showing
@@ -794,18 +819,32 @@
 
         const map=new Map();
 
+        // CTgoodjobs puts the employer id in the company link (/company-jobs/00013807/michael-page)
+        // and the crawler has been reading it into "Company ID" all along without ever using it -
+        // every row was grouped on the name alone. The id is the better key: it holds when the same
+        // employer is written "Michael Page" on one card and "Michael Page International (HK) Ltd"
+        // on the next, which the folded name cannot fold together.
+        //
+        // core.companyKeys is what stops that becoming a NEW duplicate: the link is missing on some
+        // cards, so keying each row on its own would put the linked listings on one row and the rest
+        // on another. Every listing of a name that was ever seen with an id goes to that id.
+        const keyOf=core.companyKeys(rows,row=>row["Company ID"],row=>row["Company"]||"(unknown)");
+
         rows.forEach(row=>{
 
-            const key=companyKey(row);
-
-            if(!key) return;
+            // "" used to be returned for a listing whose company name could not be read, and the
+            // caller dropped the row on it - the JOB was thrown away because its employer was
+            // unnamed. It goes to one "(unknown)" row instead, where it can at least be seen.
+            const key=keyOf(row);
 
             let company=map.get(key);
 
             if(!company){
 
                 company={
-                    name:row["Company"],
+                    name:row["Company"]||"(unknown)",
+                    // the model map is keyed by folded NAME, not by this row's key - see step 4
+                    nameKey:nameKey(row["Company"]||"(unknown)"),
                     jobs:0,
                     locations:[],
                     positions:[],
@@ -823,7 +862,7 @@
 
             company.jobs++;
 
-            push(company.positions,row["Job Title"]);
+            keep(company.positions,row["Job Title"]);
 
             // CTgoodjobs writes "-" when a listing declares no location
             if(row["Location"]!=="-") push(company.locations,row["Location"]);
@@ -844,6 +883,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per LISTING, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Accountant" listings reached the file as one position and read as though it
+    // were hiring for one. Location and Remote/Onsite keep using push(), because those describe the
+    // company and really are a set: "Central, Central, Central" is noise, three identical job titles
+    // are three jobs.
+    //
+    // A listing whose title could not be read is still a listing, so it is marked rather than
+    // dropped - the number of entries in the cell always equals the number of listings behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     //---------------------------------------------------

@@ -162,7 +162,9 @@
 
             for(const job of saved.jobs){
 
-                const id=job&&job["Job ID"];
+                // `key` is what collectFrom keys `visited` on; "Job ID" is the fallback for a
+                // checkpoint written before that field existed
+                const id=job&&(job.key||job["Job ID"]);
 
                 if(!id||visited.has(id)) continue;
 
@@ -348,6 +350,21 @@
         await core.mapPool(companies,concurrency,async(company,index)=>{
 
             company.failed=false;
+
+            // No listing of this company had a readable link, so there is no job page to open and
+            // therefore no route to the company profile. Left blank rather than fetched: "" resolves
+            // to the search page itself, which answers 200, carries no profile link, and costs a
+            // request plus a retry pass to arrive at the same empty cell.
+            if(!company.jobUrl){
+
+                if(!company.counted){
+                    company.counted=true;
+                    processed++;
+                }
+
+                return;
+
+            }
 
             const doc=await fetchDoc(company.jobUrl);
 
@@ -698,27 +715,45 @@
 
         let added=0;
         let search=0;
+        let noOwnId=0;
 
         cards.forEach(card=>{
 
             const link=card.querySelector('[data-testid="job-card-link"]');
 
-            if(!link) return;
-
-            const href=link.getAttribute("href")||"";
+            const href=link&&link.getAttribute("href")||"";
 
             // count real result cards separately (excluding "Recommended") to know when everything is in
-            if(!/event=SuggestedJob/.test(href)) search++;
+            if(href&&!/event=SuggestedJob/.test(href)) search++;
 
             // a 32 hex character uuid at the end of the path
-            const id=(href.split("?")[0].match(/([0-9a-f]{32})$/)||[])[1];
+            const path=href.split("?")[0];
+            const uuid=(path.match(/([0-9a-f]{32})$/)||[])[1]||"";
+
+            // The uuid, then the link's own path, and only then what the card says.
+            //
+            // A card with no link, or a link MCF has changed the shape of, used to be dropped here -
+            // the JOB was lost over the id. The path is just as unique per listing as the uuid, and
+            // the fingerprint is what is left when there is no link at all. It is made of the card's
+            // text rather than its position on purpose: pages are fetched in parallel and re-read on
+            // a resumed run, so an index-based key would give one listing a new identity each time
+            // and duplicate it instead of deduplicating it.
+            const own=uuid||path;
+
+            if(!own) noOwnId++;
+
+            const id=own||("card:"+[
+                pick(card,'[data-testid="job-card__job-title"]'),
+                pick(card,'[data-testid="company-hire-info"]'),
+                pick(card,'[data-testid="job-card__location"]')
+            ].join("|"));
 
             // "Recommended" jobs repeat inside the normal results -> dedupe by uuid
-            if(!id||visited.has(id)) return;
+            if(visited.has(id)) return;
 
             visited.add(id);
 
-            jobs.push(readCard(card,id,href));
+            jobs.push(readCard(card,uuid,href,id));
 
             added++;
 
@@ -726,6 +761,11 @@
 
         if(cards.length===0){
             console.warn(LOG,'no [data-testid="job-card"] on this page');
+        }
+
+        if(noOwnId){
+            console.warn(LOG,`${noOwnId} of ${cards.length} card(s) had no job link - they were kept `
+                +"and identified by what the card says, but they have no Job URL to read details from");
         }
 
         return {cards:cards.length,added,search};
@@ -736,7 +776,7 @@
     // helper: read one card
     //---------------------------------------------------
 
-    function readCard(card,id,href){
+    function readCard(card,id,href,key){
 
         const salary=readSalary(card);
 
@@ -746,6 +786,11 @@
         return {
             postedText:posted.text,
             postedAge:posted.age,
+
+            // What `visited` was keyed on, kept so a resumed run keys on the same thing. "Job ID" is
+            // MCF's uuid and is empty for a card that had no link, so resuming on that dropped
+            // exactly the jobs this fallback exists to save.
+            key:key||id,
 
             // MCF's FWA field: "Flexi-Hours" / "Work-From-Home" / "Hybrid"
             fwa:pick(card,'[data-testid="job-card__fwa"]'),
@@ -764,7 +809,10 @@
             "Applications":pick(card,'[data-testid="job-card__num-of-applications"]'),
             "Posted":pick(card,'[data-cy="job-card-date-info"]'),
             "Source":/event=SuggestedJob/.test(href)?"Recommended":"Search",
-            "Job URL":ORIGIN+href.split("?")[0]
+            // "" rather than ORIGIN when the card had no link at all: the detail phase fetches this
+            // URL, and ORIGIN is the search page itself - a request that succeeds, carries no
+            // company profile link, and quietly costs the company its Employees cell
+            "Job URL":href?ORIGIN+href.split("?")[0]:""
         };
 
     }
@@ -926,7 +974,7 @@
 
             }
 
-            push(company.positions,job["Job Title"]);
+            keep(company.positions,job["Job Title"]);
             push(company.locations,job["Location"]);
             push(company.modes,readMode(job.fwa));
 
@@ -934,8 +982,11 @@
             if(job.postedAge<company.postedAge){
                 company.postedAge=job.postedAge;
                 company.posted=job.postedText;
-                company.jobUrl=job["Job URL"];
+                if(job["Job URL"]) company.jobUrl=job["Job URL"];
             }
+
+            // ...and the row still needs A url even when its newest listing had none
+            if(!company.jobUrl&&job["Job URL"]) company.jobUrl=job["Job URL"];
 
         }
 
@@ -945,6 +996,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per LISTING, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Software Engineer" listings reached the file as one position and read as though
+    // it were hiring for one. Location and Remote/Onsite keep using push(), because those describe
+    // the company and really are a set: "Central, Central, Central" is noise, three identical job
+    // titles are three jobs.
+    //
+    // A listing whose title could not be read is still a listing, so it is marked rather than
+    // dropped - the number of entries in the cell always equals the number of listings behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     // MCF never writes Onsite; there is only FWA, and "Flexi-Hours" is about working hours

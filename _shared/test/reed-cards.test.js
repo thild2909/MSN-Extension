@@ -62,9 +62,15 @@ function card(job){
         +`<button class="index-module_jobTitleBtn__block__lbc49 btn btn-link" type="button" data-qa="job-title-btn-wrapper">${job.title}</button>`
         +`<div class="row"><div class="index-module_container__2Gt-v col-sm-12 col-md-7"><header>${badges}`
         +`<h2 class="index-module_jobResultHeading__title__r7Yqg"><a href="/jobs/${job.titleSlug}/${job.id}?source=searchResults&amp;q=software%20developer" class="index-module_jobTitle__702ZU" color="link" data-id="${job.id}" title="${job.title}" data-qa="job-card-title" data-page-component="job_card" data-element="job_title">${job.title}</a></h2>`
-        +`<div data-qa="job-posted-by" class="index-module_postedBy__nBQbf">${job.company
-            ? `${job.posted} by <a href="/jobs/${job.slug}/p${job.pid}" class="index-module_profileUrl__1BKrL gtmJobListingPostedBy" data-element="recruiter">${job.company}</a>`
-            : job.posted}</div>`
+        // `noProfile` is the third real shape: the recruiter is named, but in plain text with no
+        // /p<id> anywhere on the card. Reed renders this whenever the agency has no profile page
+        // set up on that ad - which is why an employer can arrive WITH an id on one card and
+        // WITHOUT on the next, the case core.companyKeys exists for.
+        +`<div data-qa="job-posted-by" class="index-module_postedBy__nBQbf">${!job.company
+            ? job.posted
+            : job.noProfile
+            ? `${job.posted} by ${job.company}`
+            : `${job.posted} by <a href="/jobs/${job.slug}/p${job.pid}" class="index-module_profileUrl__1BKrL gtmJobListingPostedBy" data-element="recruiter">${job.company}</a>`}</div>`
         +`<ul class="index-module_jobMetadata__Hmbnh list-group list-group-horizontal" role="list" data-qa="job-metadata">`
         +`<li data-qa="job-metadata-salary" class="index-module_jobMetadata__item__xWXZK list-group-item" role="listitem "><svg viewBox="0 0 16 16" role="img" aria-label="Salary"><use xlink:href="#svg-salary" x="0" y="0"></use></svg>${job.salary}</li>`
         +`<li data-qa="job-metadata-location" class="index-module_jobMetadata__item__xWXZK list-group-item" role="listitem "><svg viewBox="0 0 16 16" role="img" aria-label="Location"><use xlink:href="#svg-location" x="0" y="0"></use></svg>${job.location}</li>`
@@ -127,7 +133,16 @@ const PAGE1=[
 // is what has to hold them together, because the names alone would not.
 const PAGE2=[
     {id:"57078290",title:"ADA Software Engineer",titleSlug:"ada-software-engineer",company:"Matchtech ",slug:"matchtech-19617",pid:"19617",posted:"1 July",salary:"£68 per hour",location:"Bristol, Avon",logo:"image"},
-    {id:"57188553",title:"Software Developer - DV Cleared - Various Locations",titleSlug:"software-developer-dv-cleared-various-locations",company:"Matchtech Engineering Ltd",slug:"matchtech-19617",pid:"19617",posted:"5 August",salary:"£450 - £600 per day",location:"London",logo:""}
+    {id:"57188553",title:"Software Developer - DV Cleared - Various Locations",titleSlug:"software-developer-dv-cleared-various-locations",company:"Matchtech Engineering Ltd",slug:"matchtech-19617",pid:"19617",posted:"5 August",salary:"£450 - £600 per day",location:"London",logo:""},
+
+    // Two ads for the SAME role at one agency, and only the first of them carries a profile link.
+    // Both halves of this pair are things the export used to get wrong:
+    //   * the second card has no /p<id>, so keying each ad on its own filed it under the folded
+    //     NAME while the first went to "id:90210" - one agency, two rows, a position each
+    //   * both ads are titled "Software Engineer", and the Positions cell was built with a
+    //     unique-push, so two live vacancies were written as one
+    {id:"57190011",title:"Software Engineer",titleSlug:"software-engineer",company:"Nexa Systems",slug:"nexa-systems-90210",pid:"90210",posted:"2 days ago",salary:"£55,000 per annum",location:"Leeds, West Yorkshire",logo:"text"},
+    {id:"57190012",title:"Software Engineer",titleSlug:"software-engineer",company:"Nexa Systems Ltd",slug:"",pid:"",posted:"6 days ago",salary:"£55,000 per annum",location:"Leeds, West Yorkshire",logo:"",noProfile:true}
 ];
 
 // A profile page that publishes a size, next to one that does not. Both are real shapes: Reed's
@@ -143,7 +158,8 @@ function profilePage(size){
 const PROFILES={
     "106589":profilePage("251 to 500 employees"),
     "69909":profilePage("1,001-5,000 employees"),
-    "19617":profilePage("")
+    "19617":profilePage(""),
+    "90210":profilePage("11 to 50 employees")
 };
 
 //---------------------------------------------------
@@ -324,17 +340,19 @@ function rowFor(name){
     check("the walk stopped on the first page with no cards",!asked.some(url=>/pageno=[4-9]/.test(url)),
         asked.filter(url=>/pageno=/.test(url)).join(", "));
 
-    // 9 ads on page 1 from 8 recruiters (Awin twice, one card with no recruiter at all), 2 on
-    // page 2 from one -> 9 rows
-    check("one row per recruiter, not per ad",rows.length===9,
+    // 9 ads on page 1 from 8 recruiters (Awin twice, one card with no recruiter at all), 4 on
+    // page 2 from two (Matchtech twice, Nexa twice) -> 10 rows
+    check("one row per recruiter, not per ad",rows.length===10,
         rows.length+" rows: "+rows.map(r=>r["Company Name"]).join(" | "));
 
     check("a date is never written into the Company Name column",
         !rows.some(row=>/^(?:yesterday|today|\d+ \w+ ago|\d{1,2} [A-Z][a-z]+)$/i.test(row["Company Name"])),
         rows.map(r=>r["Company Name"]).join(" | "));
 
+    // first hit on page 1 first, last hit on page 2 last - so the sheet can be read straight down
+    // against the site. Nexa is last because its cards are the last two on page 2.
     check("rows are in the order Reed shows them",
-        rows[0]["Company Name"]==="ITOL Recruit"&&rows[rows.length-1]["Company Name"]==="Matchtech",
+        rows[0]["Company Name"]==="ITOL Recruit"&&rows[rows.length-1]["Company Name"]==="Nexa Systems",
         rows.map(r=>r["Company Name"]).join(" | "));
 
     const itol=rowFor("ITOL Recruit");
@@ -405,6 +423,40 @@ function rowFor(name){
     check("every profile page was asked for exactly once",
         asked.filter(url=>/\/p19617$/.test(url)).length===1,
         asked.filter(url=>/\/p\d+$/.test(url)).join(", "));
+
+    //---------------------------------------------------
+    // every ad reaches the file, and one employer is one row however its cards were written
+    //---------------------------------------------------
+
+    const nexa=rowFor("Nexa Systems")||rowFor("Nexa Systems Ltd");
+
+    check("an ad with a profile link and one without are ONE row",
+        !!nexa&&!rows.some(row=>row!==nexa&&/^Nexa Systems/.test(row["Company Name"])),
+        rows.map(r=>r["Company Name"]).join(" | "));
+
+    // The one this file exists to pin down. Both Nexa ads are titled "Software Engineer" and both
+    // are live vacancies; a Positions cell built with a unique-push wrote them as one, so the sheet
+    // said the agency was hiring for a single role when it was hiring for two.
+    check("two ads for the same role are two positions, not one",
+        nexa&&nexa["Positions"]==="Software Engineer | Software Engineer",
+        nexa&&JSON.stringify(nexa["Positions"]));
+
+    // ...and the row still reaches the id-only data, which it can only do if the ad WITH the
+    // profile link is the one that named it
+    check("the row keeps the headcount from the card that had the profile link",
+        nexa&&nexa["Employees"]==="11 to 50 employees",nexa&&JSON.stringify(nexa["Employees"]));
+
+    // Across the whole sheet: every ad that was read is somewhere in a Positions cell. This is the
+    // guarantee, stated once against the total rather than per company - 13 cards over two pages.
+    const positions=rows.reduce((total,row)=>total+row["Positions"].split(" | ").filter(Boolean).length,0);
+
+    check("every ad read is an entry in some Positions cell",positions===PAGE1.length+PAGE2.length,
+        positions+" positions from "+(PAGE1.length+PAGE2.length)+" ads");
+
+    // ...while the columns that describe the COMPANY stay a set. Nexa posted both ads in Leeds, and
+    // "Leeds, West Yorkshire, Leeds, West Yorkshire" would be noise rather than data.
+    check("a repeated location is still written once",
+        nexa&&nexa["Location"]==="Leeds, West Yorkshire",nexa&&nexa["Location"]);
 
     console.log("\n"+passed+" passed, "+failed+" failed");
 

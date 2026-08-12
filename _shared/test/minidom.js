@@ -120,6 +120,35 @@ class Node{
 
 const ATTR=/([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
 
+// A browser decodes entities as it parses, so getAttribute("href") on
+//   <a href="/jobs?q=x&amp;pageno=2">
+// answers "/jobs?q=x&pageno=2" - with a real "&", which is the only thing that makes it a second
+// query parameter. Leaving the "&amp;" in place turns the parameter into "amp;pageno", so a
+// crawler reading ?pageno= off the link finds nothing there. Every site in this folder writes its
+// paginator that way, so without this the fixtures silently test the FALLBACK path (counting
+// ?pageno= forward) and the link path is never exercised at all.
+const ENTITY=/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z][a-zA-Z0-9]*));/g;
+
+const NAMED={amp:"&",lt:"<",gt:">",quot:'"',apos:"'",nbsp:" ",pound:"£",euro:"€",
+    hellip:"…",ndash:"–",mdash:"—",rsquo:"’",lsquo:"‘",rdquo:"”",ldquo:"“"};
+
+function decode(text){
+
+    if(text.indexOf("&")<0) return text;
+
+    return text.replace(ENTITY,(all,dec,hex,name)=>{
+
+        if(dec) return String.fromCodePoint(+dec);
+
+        if(hex) return String.fromCodePoint(parseInt(hex,16));
+
+        // an unknown entity is left exactly as written rather than swallowed
+        return Object.prototype.hasOwnProperty.call(NAMED,name)?NAMED[name]:all;
+
+    });
+
+}
+
 function parseAttrs(text){
 
     const attrs={};
@@ -129,9 +158,9 @@ function parseAttrs(text){
     ATTR.lastIndex=0;
 
     while((match=ATTR.exec(text))!==null){
-        attrs[match[1].toLowerCase()]=match[2]!==undefined?match[2]
+        attrs[match[1].toLowerCase()]=decode(match[2]!==undefined?match[2]
             :match[3]!==undefined?match[3]
-            :match[4]!==undefined?match[4]:"";
+            :match[4]!==undefined?match[4]:"");
     }
 
     return attrs;
@@ -249,7 +278,7 @@ function parse(html){
 
         const node=new Node("",{});
 
-        node.nodeValue=text;
+        node.nodeValue=decode(text);
 
         push(node);
 

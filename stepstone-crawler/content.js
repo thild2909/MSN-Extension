@@ -671,10 +671,10 @@
 
             const job=readCard(card,page,rank++);
 
-            if(!job.id){
-                dropped++;
-                return;
-            }
+            // readCard always returns an id now - see the note there. This counts the ones it had
+            // to invent, because that means a build renamed the attribute AND the ad carried no
+            // link either, which is worth one line. It is no longer a job being thrown away.
+            if(!job.hasOwnId) dropped++;
 
             if(visited.has(job.id)){
 
@@ -698,11 +698,11 @@
 
         });
 
-        // a card with no identity used to be skipped in silence, so a build that renamed the id
-        // attribute emptied every page while the run still reported "+0 job(s)" and carried on
+        // a card with neither an id nor a link used to be SKIPPED here, which threw the ad away
+        // over a missing attribute. It is kept now and identified by where it sat in the list.
         if(dropped){
             console.warn(LOG,`${dropped} of ${cards.length} card(s) on page ${page} had neither an`
-                +" id nor a link and were skipped");
+                +" id nor a link - they were kept and identified by their place in the list");
         }
 
         return {cards:cards.length,added,dropped,elsewhere};
@@ -746,16 +746,27 @@
 
         const companyUrl=linkHref(logo);
         const jobUrl=jobLink(card,title);
+        const name=norm(title);
+        const company=pick(card,COMPANY);
+
+        // id="job-item-13961958". StepStone hashes and renames attributes per build, so fall back
+        // to the ad's own URL rather than dropping the card: either one is unique per ad and that
+        // is all `visited` needs.
+        //
+        // And when neither is there, fall back to where the ad sits in the list rather than
+        // returning "" - the caller used to drop the job on that, so an ad with no id AND no link
+        // was lost entirely. The page number is deliberately left out: StepStone answers a page
+        // number past the end by re-serving an earlier page, and the walk only knows that because
+        // the ads come back with ids it has already seen.
+        const own=(card.getAttribute("id")||"").replace(/^job-item-/,"")||jobUrl;
 
         return {
-            // id="job-item-13961958". StepStone hashes and renames attributes per build, so fall
-            // back to the ad's own URL rather than dropping the card: either one is unique per ad
-            // and that is all `visited` needs.
-            id:(card.getAttribute("id")||"").replace(/^job-item-/,"")||jobUrl,
+            id:own||`${company}|${name}|#${rank}`,
+            hasOwnId:!!own,
             page,
             rank,
-            title:norm(title),
-            company:pick(card,COMPANY),
+            title:name,
+            company,
             location:pick(card,LOCATION),
             workFromHome:pick(card,WFH),
             postedText:posted.text,
@@ -811,14 +822,21 @@
         // the cells back into the order StepStone shows.
         const ordered=[...list].sort((a,b)=>(a.page||0)-(b.page||0)||(a.rank||0)-(b.rank||0));
 
+        // Group by company id; without an id, fall back to the folded name rather than the
+        // lowercased one, so "N26 GmbH" and "N26 GmbH." do not become two rows each holding a
+        // slice of the positions.
+        //
+        // core.companyKeys is what makes the two agree. The employer id comes off the LOGO link,
+        // and whether that renders is a property of the card - a sponsored ad or a build that
+        // renamed data-at drops it - so the same employer arrived as "id:241382" on one page and
+        // "name:n26" on the next: two rows, which is the duplicate the folded name exists to stop.
+        const keyOf=core.companyKeys(ordered,job=>job.employerId,job=>job.company||"(unknown)");
+
         for(const job of ordered){
 
             const name=job.company||"(unknown)";
 
-            // group by company id; without an id, fall back to the folded name rather than the
-            // lowercased one, so "N26 GmbH" and "N26 GmbH." do not become two rows each holding
-            // a slice of the positions
-            const key=job.employerId?"id:"+job.employerId:"name:"+core.nameKey(name);
+            const key=keyOf(job);
 
             job.key=key;
 
@@ -851,7 +869,7 @@
 
             company.jobs++;
 
-            push(company.positions,job.title);
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,readMode(job.workFromHome,job.location));
 
@@ -861,6 +879,10 @@
                 company.posted=job.postedText;
                 if(job.jobUrl) company.jobUrl=job.jobUrl;
             }
+
+            // the row may have been opened by an ad whose logo link never rendered, so take the id
+            // from whichever of this company's ads did carry one
+            if(!company.employerId&&job.employerId) company.employerId=job.employerId;
 
             if(!company.companyUrl&&job.companyUrl) company.companyUrl=job.companyUrl;
             if(!company.jobUrl&&job.jobUrl) company.jobUrl=job.jobUrl;
@@ -877,6 +899,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per AD, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Softwareentwickler" ads reached the file as one position and read as though it
+    // were hiring for one. Location and Remote/Onsite keep using push(), because those describe the
+    // company and really are a set: "Berlin, Berlin, Berlin" is noise, three identical job titles
+    // are three jobs.
+    //
+    // An ad whose title could not be read is still an ad, so it is marked rather than dropped - the
+    // number of entries in the cell always equals the number of ads behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     // The Location field is where the truth is. StepStone's work-from-home badge only has two

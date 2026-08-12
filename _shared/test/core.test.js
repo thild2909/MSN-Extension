@@ -46,6 +46,57 @@ check("Acme Tech != Acme Technologies",core.nameKey("Acme Tech")!==core.nameKey(
 check("Acme != Beta",core.nameKey("Acme")!==core.nameKey("Beta"));
 check("'Ltd.' alone keeps an identity",core.nameKey("Ltd.")!==core.nameKey("Inc."));
 
+console.log("\ncore.companyKeys - one row per employer, even when only some of its ads carry an id");
+
+// The bug this exists for: whether a card renders the company link is a property of the CARD, so
+// within one search the same employer arrives with an id on some ads and without on others. Keyed
+// one ad at a time that is "id:658" AND "name:acme" - two rows, each with a slice of the positions.
+const mixed=[
+    {id:"658",company:"Acme Pte Ltd"},
+    {id:"",   company:"ACME Pte. Ltd."},
+    {id:"658",company:"Acme"},
+    {id:"",   company:"Beta GmbH"},
+    {id:"",   company:"Beta"}
+];
+
+const keyOf=core.companyKeys(mixed,job=>job.id,job=>job.company);
+
+check("an ad with the id and one without land on the same row",keyOf(mixed[0])===keyOf(mixed[1]),
+    keyOf(mixed[0])+" vs "+keyOf(mixed[1]));
+
+check("...and that row is keyed by the id, not the spelling",keyOf(mixed[1])==="id:658",keyOf(mixed[1]));
+
+check("a differently written name under the same id is still one row",keyOf(mixed[2])==="id:658");
+
+check("a company that never carried an id keeps its folded name",
+    keyOf(mixed[3])==="name:"+core.nameKey("Beta GmbH"),keyOf(mixed[3]));
+
+check("...and folds across legal forms exactly as before",keyOf(mixed[3])===keyOf(mixed[4]));
+
+check("two different employers stay apart",keyOf(mixed[0])!==keyOf(mixed[3]));
+
+// The order the ads arrive in must not decide the key, or two runs of one search produce two
+// different sheets - and on Reed/StepStone the row ORDER is derived from it.
+const reversed=core.companyKeys([...mixed].reverse(),job=>job.id,job=>job.company);
+
+check("the key does not depend on the order the ads were read in",
+    mixed.every(job=>keyOf(job)===reversed(job)));
+
+// Two employers whose names fold together while ONE of them has an id: the id must not swallow
+// the other, and it must not flip depending on which was seen first.
+const clash=[{id:"",company:"Acme"},{id:"77",company:"Acme"},{id:"",company:"Acme"}];
+const clashKey=core.companyKeys(clash,job=>job.id,job=>job.company);
+
+check("a name seen with an id sends all of its ads to that id",
+    clashKey(clash[0])==="id:77"&&clashKey(clash[2])==="id:77");
+
+// An empty list must not throw, and a job whose company could not be read must still get a key -
+// it is a real job and has to reach the file under something rather than being dropped.
+const empty=core.companyKeys([],job=>job.id,job=>job.company);
+
+check("an unnamed company still gets a key",typeof empty({id:"",company:""})==="string"
+    &&empty({id:"",company:""}).length>0,empty({id:"",company:""}));
+
 console.log("\ncore.exportXlsx - clips cells past Excel's ceiling instead of writing an unopenable file");
 const long="x".repeat(40000);
 const out=core.exportXlsx([{A:long,B:"short"}],{headers:["A","B"],filename:"t.xlsx"});

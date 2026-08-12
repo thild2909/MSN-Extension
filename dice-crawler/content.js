@@ -597,6 +597,11 @@
         let dropped=0;
         let elsewhere=0;
 
+        // the entry's position in THIS page's list, so an ad with no identity of its own still
+        // gets one. Counted across the whole page rather than per group: with "Group by company"
+        // on, a per-group counter would hand two different companies' first ads the same rank.
+        let rank=0;
+
         list.querySelectorAll(GROUP).forEach(group=>{
 
             const company=readCompany(group);
@@ -610,12 +615,12 @@
 
                 cards++;
 
-                const job=readEntry(entry,company,page);
+                const job=readEntry(entry,company,page,rank++);
 
-                if(!job.id){
-                    dropped++;
-                    return;
-                }
+                // readEntry always returns an id now - see the note there. This counts the ones
+                // that had to be invented, because that is a build having renamed the attribute
+                // and it is worth saying out loud; it is no longer a job being thrown away.
+                if(!job.hasOwnId) dropped++;
 
                 if(visited.has(job.id)){
 
@@ -641,10 +646,13 @@
 
         });
 
-        // a card with no identity used to be skipped in silence, so a build that renamed the id
-        // attribute would empty every page while the run still reported "+0 job(s)" and carried on
+        // a card with no identity used to be SKIPPED here, which threw the job away over a missing
+        // attribute. It is kept now and identified by its own URL, or failing that by where it sat
+        // in the list - but a build that renamed the attribute is still worth one line, because
+        // the fallback keys are weaker than the real ones.
         if(dropped){
-            console.warn(LOG,`${dropped} of ${cards} card(s) on page ${page} had no job id and were skipped`);
+            console.warn(LOG,`${dropped} of ${cards} card(s) on page ${page} had no job id of their `
+                +"own - they were kept and identified by their URL or their place in the list");
         }
 
         return {cards,added,dropped,elsewhere};
@@ -690,19 +698,34 @@
     // helper: read one job entry
     //---------------------------------------------------
 
-    function readEntry(entry,company,page){
+    function readEntry(entry,company,page,rank){
 
         const title=entry.querySelector(TITLE);
 
         const meta=readMeta(entry);
 
+        const jobUrl=title?absolute(title.getAttribute("href")||""):"";
+        const name=norm(title)||(title?title.getAttribute("aria-label")||"":"");
+
+        // data-id is the listing id, data-job-guid the one in the detail URL. Either is unique per
+        // ad and that is all `visited` needs, so a build that drops one is survivable.
+        //
+        // What is NOT survivable is dropping the ad. This used to return "" and the caller threw
+        // the whole job away, so one renamed attribute emptied every page - the job was lost over
+        // its id. The ad's own URL is the floor under that, and its place in the list the floor
+        // under THAT.
+        //
+        // The last resort deliberately leaves the page number out. Dice answers a page past its
+        // 25 page ceiling by re-serving page 25, and the walk only knows that because the ads come
+        // back with ids it has already seen; keying on the page would hand every one of them a
+        // fresh id, and the run would keep asking for pages that add nothing until the cap.
+        const own=entry.getAttribute(JOB_ID)||entry.getAttribute(JOB_GUID)||"";
+
         return {
-            // data-id is the listing id, data-job-guid the one in the detail URL. Either is
-            // unique per ad and that is all `visited` needs, so a build that drops one is
-            // survivable.
-            id:entry.getAttribute(JOB_ID)||entry.getAttribute(JOB_GUID)||"",
+            id:own||jobUrl||`${company.name}|${name}|#${rank}`,
+            hasOwnId:!!own,
             page,
-            title:norm(title)||(title?title.getAttribute("aria-label")||"":""),
+            title:name,
             company:company.name,
             companyId:company.id,
             companyUrl:company.url,
@@ -710,7 +733,7 @@
             mode:meta.mode,
             postedText:meta.posted,
             postedAge:meta.age,
-            jobUrl:title?absolute(title.getAttribute("href")||""):""
+            jobUrl
         };
 
     }
@@ -827,15 +850,20 @@
 
         const map=new Map();
 
+        // The company profile id when there is one - the same employer written two ways still
+        // lands on one row. Without an id, core.nameKey folds case, punctuation and legal-form
+        // suffixes, so "Vaco by Highspring" and "Vaco By Highspring, Inc." do not become two rows
+        // each holding a slice of the positions.
+        //
+        // core.companyKeys is what makes the two agree. Whether the logo link rendered is a
+        // property of the CARD, so the same employer arrives with an id on one page and without on
+        // the next, and keying each ad on its own gave it "id:c9d2..." and "name:vaco" - two rows,
+        // which is the duplicate the folded name is there to prevent.
+        const keyOf=core.companyKeys(list,job=>job.companyId,job=>job.company);
+
         for(const job of list){
 
-            // The company profile id when there is one - the same employer written two ways still
-            // lands on one row. Without an id, core.nameKey folds case, punctuation and legal-form
-            // suffixes, so "Vaco by Highspring" and "Vaco By Highspring, Inc." do not become two
-            // rows each holding a slice of the positions.
-            const key=job.companyId?"id:"+job.companyId:"name:"+core.nameKey(job.company||"");
-
-            if(!key) continue;
+            const key=keyOf(job);
 
             let company=map.get(key);
 
@@ -861,7 +889,7 @@
 
             company.jobs++;
 
-            push(company.positions,job.title);
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,job.mode);
 
@@ -882,6 +910,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per JOB, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Software Engineer" ads reached the file as one position and read as though it
+    // were hiring for one. The Location and Remote/Onsite columns keep using push(), because those
+    // describe the company and really are a set: "Dallas, Dallas, Dallas" is noise, "Software
+    // Engineer | Software Engineer | Software Engineer" is three jobs.
+    //
+    // A job whose title could not be read is still a job, so it is marked rather than dropped -
+    // the number of entries in the cell always equals the number of ads behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     //---------------------------------------------------

@@ -298,9 +298,13 @@
 
             for(const company of saved.unique){
 
-                if(!company||!company.url||visited.has(company.url)) continue;
+                // the same key push() files them under: a company whose card carried no /company/
+                // link has no url, and keying the resume on url alone dropped exactly those
+                const key=company&&(company.url||(company.name?"name:"+core.nameKey(company.name):""));
 
-                visited.add(company.url);
+                if(!key||visited.has(key)) continue;
+
+                visited.add(key);
                 unique.push(company);
                 resumed++;
 
@@ -554,16 +558,30 @@
             // a run of 403s no longer means the detail data is simply lost. A null here therefore
             // means BOTH ways were refused, which is a real failure worth counting - unlike the
             // old ~855 "failures" that were never sent in the first place.
-            const doc=await fetchDoc(company.url);
+            //
+            // No url at all is not a failure: the card carried no /company/ link, so there is no
+            // profile to open. Everything below already copes with an unread page - Location falls
+            // back to the job's own place and the jobs are the ones the card printed - and asking
+            // for "" would fetch the search page itself, at the cost of a request, a retry pass and
+            // a tab load, to arrive at the same answer.
+            const doc=company.url?await fetchDoc(company.url):null;
 
             if(!doc){
 
-                failed++;
+                // ...but only a page that was ASKED FOR and refused is a failure. A company with no
+                // url was never requested, and counting it here would send the retry pass after a
+                // page that does not exist - which is the same mistake the breaker note above
+                // describes, one level down.
+                if(company.url){
 
-                // marked so the retry pass can come back for it: a company refused at the
-                // busiest moment of the run is usually readable once the queue has drained,
-                // and a blank size cell is indistinguishable from "publishes no headcount"
-                company.failedFetch=true;
+                    failed++;
+
+                    // marked so the retry pass can come back for it: a company refused at the
+                    // busiest moment of the run is usually readable once the queue has drained,
+                    // and a blank size cell is indistinguishable from "publishes no headcount"
+                    company.failedFetch=true;
+
+                }
 
             }
             else{
@@ -636,7 +654,7 @@
             if(jobs.length){
                 savedFetches++;
             }
-            else{
+            else if(company.url){
 
                 const jobsDoc=await fetchDoc(company.url+"/jobs");
 
@@ -900,10 +918,12 @@
 
             const a=card.querySelector('a[href^="/company/"]');
 
-            if(!a){
-                stats.cardsNoLink++;
-                return;
-            }
+            // A card with no /company/ anchor used to be dropped outright, taking its jobs with it -
+            // and this is the crawler where a card IS a company, so that was a whole row lost over a
+            // link. It is kept now under a name-derived key: there is no profile page to open, so
+            // Location and Employees can only come from the card itself, but the company and its
+            // positions still reach the file instead of vanishing.
+            if(!a) stats.cardsNoLink++;
 
             // Wellfound's list page also lists the jobs under each company ->
             // reading them here saves one request per company
@@ -921,7 +941,9 @@
 
             jobsOnPage+=jobs.length;
 
-            if(push(norm(card.querySelector("h2"))||norm(a),a.getAttribute("href"),findSizeNear(card),jobs)) added++;
+            const name=norm(card.querySelector("h2"))||norm(a);
+
+            if(push(name,a?a.getAttribute("href"):"",findSizeNear(card),jobs)) added++;
 
         });
 
@@ -947,23 +969,35 @@
         // Strip query, fragment and any sub-tab. "/company/acme" and "/company/acme/jobs" are
         // the same company, and this doubles as the URL we fetch, so it has to be the profile
         // rather than one of its tabs. The raw-anchor fallback below picks up both forms.
-        const path=href.split(/[?#]/)[0]
+        const path=(href||"").split(/[?#]/)[0]
             .replace(/\/(?:jobs|about|culture|people)\/?$/i,"")
             .replace(/\/+$/,"");
 
-        const url="https://wellfound.com"+path;
+        // The profile URL is the identity AND the page to fetch, so a card with no link has neither.
+        // It still gets a key - the folded name - so it is deduplicated against its own repeats and
+        // reaches the file. `url` stays empty on purpose: everything downstream tests it before
+        // fetching, and a made-up /company/<slug> would be a guaranteed 404 given a request, a
+        // retry pass and a tab load each.
+        const url=path?"https://wellfound.com"+path:"";
+        const key=url||("name:"+core.nameKey(name));
+
         const list=jobs||[];
 
         // Count jobs BEFORE dropping duplicate companies: Wellfound counts "results" as jobs,
         // so the jobs on a repeated card are part of that number too.
         stats.jobsSeen+=list.length;
 
-        if(visited.has(url)){
+        // A card with neither a link nor a name is not a company - there is nothing to dedupe it
+        // against and nothing to write in the Company Name column. (Already counted by the caller
+        // as a card without a company link, which is what it is.)
+        if(!key||key==="name:") return false;
+
+        if(visited.has(key)){
             stats.companyDupes++;
             return false;
         }
 
-        visited.add(url);
+        visited.add(key);
 
         unique.push({
             name,

@@ -1084,16 +1084,21 @@
         if(cards.length===0) cards=root.querySelectorAll(CARD_FALLBACK);
 
         let added=0;
+        let noId=0;
 
         cards.forEach(card=>{
 
             // Indeed renders an extra hidden card for the detail pane on the right -> drop it
             if(card.getAttribute("aria-hidden")==="true") return;
 
-            const link=card.querySelector("a[data-jk]");
-            const id=link?link.getAttribute("data-jk"):"";
+            const id=cardJobId(card);
 
-            if(!id||visited.has(id)) return;
+            if(!id){
+                noId++;
+                return;
+            }
+
+            if(visited.has(id)) return;
 
             visited.add(id);
 
@@ -1103,7 +1108,51 @@
 
         });
 
+        // A card with no readable jk is not lost: collectFromJson reads the same page's embedded
+        // provider payload, where every card ships with its jobkey, and the two share `visited`. So
+        // this is a warning about the markup rather than about the data - but if the JSON is also
+        // unreadable on this build, this line is the only thing that will say where the jobs went.
+        if(noId){
+            console.warn(LOG,`${noId} of ${cards.length} card(s) had no job key in their markup - `
+                +"those come from the page's embedded JSON instead");
+        }
+
         return {cards:cards.length,added};
+
+    }
+
+    // The card's job key.
+    //
+    // data-jk on the title link is where it normally is. When a build stops rendering that
+    // attribute the key is still in the ad's own href (?jk=... / /rc/clk?jk=...), and reading it
+    // from there is what keeps the card and its JSON twin on ONE id: a synthetic id would pass
+    // `visited` and add the same job a second time, which is the opposite of the problem being
+    // fixed. If neither is there, collectFromJson still has the job - see the note above.
+    function cardJobId(card){
+
+        const link=card.querySelector("a[data-jk]");
+        const attr=link&&link.getAttribute("data-jk");
+
+        if(attr) return attr;
+
+        for(const a of card.querySelectorAll("a[href]")){
+
+            const match=/[?&]jk=([^&#]+)/.exec(a.getAttribute("href")||"");
+
+            if(match){
+
+                try{
+                    return decodeURIComponent(match[1]);
+                }
+                catch(e){
+                    return match[1];
+                }
+
+            }
+
+        }
+
+        return "";
 
     }
 
@@ -1388,15 +1437,25 @@
 
         const map=new Map();
 
+        // "ACME Pte Ltd" and "ACME Pte. Ltd." are one employer and used to become two rows, each
+        // holding a slice of the positions. core.nameKey folds case, punctuation and a closed list
+        // of legal-form suffixes - and nothing else, so distinct employers ("Acme Tech" vs "Acme
+        // Technologies") still stay apart.
+        //
+        // The /cmp/<slug> path is a better key than any spelling of the name, and it is the one
+        // Indeed itself uses: the same employer's cards are written inconsistently ("DBS Bank" /
+        // "DBS Bank Ltd" / "DBS") while every one of them links to /cmp/DBS-Bank. Only SOME cards
+        // carry that link though - it is a property of the card, not the employer - which is why
+        // this goes through core.companyKeys rather than being read per job: keyed one ad at a time
+        // the linked ads went to "id:/cmp/DBS-Bank" and the rest to "name:dbs bank", i.e. two rows
+        // for one company, which is the duplicate the folded name exists to prevent.
+        const keyOf=core.companyKeys(list,job=>job.companyUrl,job=>job.company||"(unknown)");
+
         for(const job of list){
 
             const name=job.company||"(unknown)";
 
-            // "ACME Pte Ltd" and "ACME Pte. Ltd." are one employer and used to become two rows,
-            // each holding a slice of the positions. core.nameKey folds case, punctuation and a
-            // closed list of legal-form suffixes - and nothing else, so distinct employers
-            // ("Acme Tech" vs "Acme Technologies") still stay apart.
-            const key=core.nameKey(name);
+            const key=keyOf(job);
 
             let company=map.get(key);
 
@@ -1426,7 +1485,7 @@
             // any card that carried the /cmp/ link saves the whole company a job-page fetch
             if(!company.companyUrl&&job.companyUrl) company.companyUrl=job.companyUrl;
 
-            push(company.positions,job.title);
+            keep(company.positions,job.title);
             push(company.locations,job.location);
             push(company.modes,readMode(job.location,job.chips));
 
@@ -1446,6 +1505,20 @@
 
     function push(list,value){
         if(value&&!list.includes(value)) list.push(value);
+    }
+
+    // Positions is one entry per AD, not per distinct title.
+    //
+    // push() was used here too, and it drops a value the list already holds - so a company running
+    // four separate "Software Engineer" ads reached the file as one position and read as though it
+    // were hiring for one. Location and Remote/Onsite keep using push(), because those describe the
+    // company and really are a set: "Singapore, Singapore, Singapore" is noise, three identical job
+    // titles are three jobs.
+    //
+    // An ad whose title could not be read is still an ad, so it is marked rather than dropped - the
+    // number of entries in the cell always equals the number of ads behind the row.
+    function keep(list,value){
+        list.push(value||"(untitled)");
     }
 
     // The work location lives in the location field ("Remote", "Hybrid work in Singapore") or
