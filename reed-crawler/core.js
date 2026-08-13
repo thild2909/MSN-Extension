@@ -1818,9 +1818,10 @@ window.CrawlerCore = (function(){
     //---------------------------------------------------
     // the file
     //
-    // Written through a blob + anchor rather than XLSX.writeFile so a download error surfaces in
-    // the console instead of failing silently, and every cell is clipped: one company with 900
-    // positions past Excel's 32,767 character ceiling produces a file that will not open at all.
+    // A CSV written through a blob + anchor, so a download error surfaces in the console instead
+    // of failing silently. Cells are still clipped: CSV itself has no length limit, but Excel
+    // truncates anything past 32,767 characters on import, so one company with 900 positions
+    // would lose the tail with nothing said about it.
     //---------------------------------------------------
 
     function clip(value,limit){
@@ -1835,51 +1836,70 @@ window.CrawlerCore = (function(){
 
     }
 
-    function exportXlsx(rows,options){
+    // Built rather than written as a literal so the mark cannot be swallowed by an editor or a
+    // copy of this file that gets re-saved in another encoding - it is invisible in every one.
+    const BOM=String.fromCharCode(0xFEFF);
+
+    // A field is quoted only when it has to be. Every crawler writes a Positions cell holding one
+    // line per ad and a Location cell holding "City, Country", so the comma and the newline are
+    // the normal case here, not the exception - an unquoted one of either splits the row and
+    // shifts every column after it.
+    function csvCell(value){
+
+        if(value===null||value===undefined) return "";
+
+        const text=String(value);
+
+        if(/[",\r\n]/.test(text)) return '"'+text.replace(/"/g,'""')+'"';
+
+        return text;
+
+    }
+
+    function exportCsv(rows,options){
 
         const o=Object.assign({
             headers:null,
-            widths:null,
-            sheet:"Companies",
-            filename:"export.xlsx",
+            filename:"export.csv",
             log:"[crawler]"
         },options||{});
 
-        if(typeof XLSX==="undefined") throw new Error("XLSX is not loaded in this tab");
-
         let clipped=0;
 
-        const safe=rows.map(row=>{
+        // Explicit headers decide the column order AND which columns exist at all: a row is a
+        // plain object, so a company that happens to carry no Location would otherwise drop the
+        // column for itself and hand every later field to the wrong header.
+        const headers=o.headers||Array.from(rows.reduce((set,row)=>{
 
-            const out={};
+            for(const key of Object.keys(row)) set.add(key);
 
-            for(const key of Object.keys(row)){
+            return set;
 
-                const value=row[key];
+        },new Set()));
+
+        const lines=[headers.map(csvCell).join(",")];
+
+        for(const row of rows){
+
+            lines.push(headers.map(header=>{
+
+                const value=row[header];
 
                 if(typeof value==="string"&&value.length>CELL_LIMIT) clipped++;
 
-                out[key]=clip(value);
+                return csvCell(clip(value));
 
-            }
+            }).join(","));
 
-            return out;
+        }
 
-        });
+        // The BOM is what makes Excel read the file as UTF-8. Without it Excel falls back to the
+        // machine's own codepage and every non-ASCII employer name - "Zürich", "Grupo Bimbo
+        // S.A.B.", every Chinese name on CTgoodjobs - opens as mojibake.
+        // CRLF for the same reason: it is what Excel writes and what its importer expects.
+        const text=BOM+lines.join("\r\n")+"\r\n";
 
-        const ws=XLSX.utils.json_to_sheet(safe,o.headers?{header:o.headers}:undefined);
-
-        if(o.widths) ws["!cols"]=o.widths.map(w=>({wch:w}));
-
-        const wb=XLSX.utils.book_new();
-
-        XLSX.utils.book_append_sheet(wb,ws,o.sheet);
-
-        const buffer=XLSX.write(wb,{bookType:"xlsx",type:"array"});
-
-        const blob=new Blob([buffer],{
-            type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        });
+        const blob=new Blob([text],{type:"text/csv;charset=utf-8"});
 
         const url=URL.createObjectURL(blob);
 
@@ -1895,9 +1915,9 @@ window.CrawlerCore = (function(){
 
         setTimeout(()=>URL.revokeObjectURL(url),60000);
 
-        if(clipped) console.warn(o.log,`${clipped} cell(s) were longer than Excel allows and were truncated`);
+        if(clipped) console.warn(o.log,`${clipped} cell(s) were longer than Excel can import and were truncated`);
 
-        return {rows:safe.length,clipped};
+        return {rows:rows.length,clipped};
 
     }
 
@@ -1943,7 +1963,7 @@ window.CrawlerCore = (function(){
         headcount,
         describeSizes,
         makeCheckpoint,
-        exportXlsx,
+        exportCsv,
         makeReporter
     };
 

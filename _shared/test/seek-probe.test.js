@@ -135,10 +135,7 @@ const sandbox={
             if(m&&m.text) reports.push(m.text);
             return {ok:false,error:"stub"};
         },onMessage:{addListener(){}}}
-    },
-
-    XLSX:{utils:{json_to_sheet:()=>({}),book_new:()=>({}),book_append_sheet:()=>{}},
-        write:()=>new Uint8Array(4)}
+    }
 };
 
 sandbox.window=sandbox;

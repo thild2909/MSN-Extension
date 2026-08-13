@@ -156,14 +156,6 @@ function run(dir){
                 sendMessage:async()=>({ok:false,error:"stub"}),
                 onMessage:{addListener(){}}
             }
-        },
-        XLSX:{
-            utils:{
-                json_to_sheet:()=>({}),
-                book_new:()=>({}),
-                book_append_sheet:()=>{}
-            },
-            write:()=>new Uint8Array(4)
         }
     };
 

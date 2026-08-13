@@ -13,8 +13,14 @@ rather than referenced. Each `*-crawler/core.js` and `*-crawler/tabs.js` is a by
 `popup.js` injects the engine ahead of `content.js`:
 
 ```js
-files: ["xlsx.full.min.js", "core.js", "content.js"]
+files: ["core.js", "content.js"]
 ```
+
+Every crawler writes a **CSV**, not an XLSX. `core.exportCsv()` builds the text itself — quoting a
+field only when it holds a comma, a quote or a newline, which for these sheets is the normal case
+rather than the exception — and prefixes a UTF-8 BOM so Excel does not open a Chinese or German
+employer name as mojibake. That is why no crawler carries `xlsx.full.min.js` (a ~900KB vendored
+SheetJS build) any more, and why nothing needs injecting ahead of `core.js`.
 
 and each crawler's `background.js` is a one-liner that pulls in the worker half:
 
@@ -63,6 +69,55 @@ at all** — both are in the RSC payload at the bottom of the document, split ac
 out of the raw HTML inside its `slice`, so the whole 2MB page is never parsed, and reads the cards
 as well: a page rescued through a tab comes back as markup with no payload behind it, and those
 jobs still have to reach the file.
+
+`startups-gallery-crawler` is the only one here that is not a job crawler: it reads the funding
+feed at `startups.gallery/news`, one row per **funding round** rather than one per company, and a
+company that raised twice is two rows and one request.
+
+It is also the only one with **no paginator at all**. The feed ships 50 rounds and loads the rest
+when a button is clicked:
+
+| URL | What arrives |
+|---|---|
+| `/news` | 50 rounds, server-rendered |
+| `/news?page=2` | the same 50 rounds |
+| `/news?skip=50` | the same 50 rounds |
+
+So the button is pressed for real, in the live tab, and the walk stops when it disappears or three
+presses in a row load nothing. Two things about that press are load-bearing:
+
+* **`element.click()` does not work on it.** The control is a Framer component — `framer-v-121ine6`
+  is its current *variant* and `data-highlight="true"` is what Framer puts on anything with a tap
+  or hover variant — so the gesture behind it is framer-motion's, and framer-motion arms a tap on
+  `pointerdown` and completes it on `pointerup`. `click()` fires neither: it dispatches one click
+  event, the tap handler never runs, and the walk reads a perfectly good feed as an exhausted one
+  and writes the first 50 rounds as a complete run. `pressButton()` sends the sequence a mouse
+  actually produces (`pointerover` → `pointerdown` → `pointerup` → native `click()`), then
+  escalates to the keyboard and then to the elements either side of the control if a press loads
+  nothing — and the summary says which gesture answered, because that is the thing most likely to
+  change under the crawler without anything looking broken.
+* Framer renders one copy of the button per breakpoint and hides all but one with CSS, so the
+  crawler presses the copy that is **laid out**. Pressing the first match presses an invisible one.
+
+Framer also re-renders the whole list rather than appending to it, so every row is read once per
+batch and the dedupe, not the reader, is what keeps one round to one line.
+
+The rest of the sheet is on the company page, which is plain HTML and fetched. Two things about
+that page decide whether the file is right:
+
+* the footer is the site's **entire directory** — every city, every stage, every fund — linking to
+  the same `../investors/` and `../categories/` routes as the company's own header pills. Read
+  naively, every company is credited with all sixteen funds. The directory's links are inline text
+  inside a paragraph (`class="framer-text"`) and the header's are not, which is the only thing that
+  tells them apart — and it is load-bearing exactly when the page arrives through a **tab**, where
+  no slice has cut the footer off first.
+* **Employees** is a bare `11–50` under an icon: no label, no link, nothing to select it by. It is
+  read as the one cell in the pill row that is not inside a pill, so a company that publishes no
+  headcount gets a blank rather than the pay band off the job card below it.
+
+Investor names come from three places in order, because a company page prints its investors as
+logos and only about half carry an `alt`: the logo's alt, then the name the **feed** spelled out
+next to the same slug, then the slug title-cased.
 
 Two columns are empty on every foundit run and the summary says so: there is no headcount on a
 card, in the payload, on a job page or in any of the fifteen search facets foundit offers, and no
@@ -170,6 +225,21 @@ node _shared/test/dice-cap.test.js ./dice-crawler
 # Finally it walks off the end of a search, where foundit answers with a 307 to page 1 rather than
 # a 404 - a request that succeeds and comes back full of jobs, and adds nothing.
 node _shared/test/foundit-pages.test.js ./foundit-crawler
+
+# drives startups-gallery-crawler against REAL startups.gallery markup, parsed for real. This is a
+# Framer site, so every class name is hashed per build and the whole crawler reads the page through
+# data-framer-name, hrefs and <time datetime> - a wrong one there writes an empty column rather
+# than crashing. The fixture holds the three traps the site is built out of:
+#   * the feed has NO page URL, so the Load More button is clicked for real - and the HIDDEN
+#     per-breakpoint copy of that button is wired to do nothing, so a crawler that picks the first
+#     match instead of the laid-out one comes away with batch 1 and calls it a complete run
+#   * the footer directory links to the same /investors/ and /categories/ routes as the header
+#     pills, and one company page arrives through a TAB, where nothing has cut the footer off
+#   * a company that publishes no headcount, whose job cards carry a pay band in a cell of exactly
+#     the same shape as the employees pill
+# It also holds the rule the sheet is built on: one row per ROUND, one request per COMPANY, and an
+# older round keeps its own stage rather than the stage the company has since raised.
+node _shared/test/sg-loadmore.test.js ./startups-gallery-crawler
 ```
 
 Run all of them after touching `core.js` or any `content.js`.

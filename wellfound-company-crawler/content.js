@@ -234,13 +234,12 @@
     try{
 
         //---------------------------------------------------
-        // 0. XLSX must be injected into the tab BEFORE content.js
-        //    (popup.js inject ["xlsx.full.min.js","content.js"])
+        // 0. core.js must be injected into the tab BEFORE content.js
         //---------------------------------------------------
 
-        if(typeof XLSX==="undefined"){
+        if(!core){
 
-            const msg="XLSX is not loaded in this tab. popup.js must inject xlsx.full.min.js before content.js.";
+            const msg="core.js is not loaded in this tab. popup.js must inject core.js before content.js.";
             console.error(LOG,msg);
             alert(msg);
             return;
@@ -787,10 +786,9 @@
         // fixed header: companies without jobs must still keep all 6 columns
         const HEADERS=["Company Name","Location","Positions","Recruitment time","Employees","Remote/Onsite"];
 
-        const written=core.exportXlsx(state.results,{
+        const written=core.exportCsv(state.results,{
             headers:HEADERS,
-            widths:[28,24,60,16,14,18],
-            filename:"wellfound_companies.xlsx",
+            filename:"wellfound_companies.csv",
             log:LOG
         });
 
@@ -805,7 +803,7 @@
         const missing=state.missingPages||lostPages;
 
         const summary=[
-            `Done in ${elapsed}s. Saved as wellfound_companies.xlsx`,
+            `Done in ${elapsed}s. Saved as wellfound_companies.csv`,
             ``,
             totals.results
                 ? `Platform:  ${totals.results} results (= jobs) over ${totals.pages||state.lastPage} page(s)`

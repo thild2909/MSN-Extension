@@ -1,14 +1,12 @@
 const button = document.getElementById("crawl");
 const status = document.getElementById("status");
-const maxPages = document.getElementById("maxPages");
-const employees = document.getElementById("employees");
+const maxClicks = document.getElementById("maxClicks");
+const details = document.getElementById("details");
 const concurrency = document.getElementById("concurrency");
-
-const INDEED_ROOT = /^https:\/\/(sg|au|hk|uk|my|de)\.indeed\.com\//;
 
 // content.js clamps this too; here it only keeps the input from accepting absurd numbers
 function parallelValue() {
-    return Math.min(8, Math.max(1, parseInt(concurrency.value, 10) || 3));
+    return Math.min(12, Math.max(1, parseInt(concurrency.value, 10) || 4));
 }
 
 async function save() {
@@ -16,8 +14,8 @@ async function save() {
     concurrency.value = parallelValue();
 
     await chrome.storage.local.set({
-        maxPages: Math.max(0, parseInt(maxPages.value, 10) || 0),
-        employees: employees.checked,
+        maxClicks: Math.max(0, parseInt(maxClicks.value, 10) || 0),
+        details: details.checked,
         concurrency: parallelValue()
     });
 
@@ -25,23 +23,15 @@ async function save() {
 
 async function init() {
 
-    const settings = await chrome.storage.local.get(["maxPages", "employees", "concurrency"]);
+    const settings = await chrome.storage.local.get(["maxClicks", "details", "concurrency"]);
 
-    if (settings.maxPages) maxPages.value = settings.maxPages;
+    if (settings.maxClicks) maxClicks.value = settings.maxClicks;
+    if (settings.details === false) details.checked = false;
     if (settings.concurrency) concurrency.value = settings.concurrency;
 
-    // off until asked for, so an absent setting must read as unticked rather than leaving
-    // whatever the markup happened to ship with
-    employees.checked = settings.employees === true;
-
-    maxPages.addEventListener("change", save);
-    employees.addEventListener("change", save);
+    maxClicks.addEventListener("change", save);
+    details.addEventListener("change", save);
     concurrency.addEventListener("change", save);
-
-    // Left behind by the proxy build. Harmless, but one of them is a Webshare API key, so it
-    // should not sit in the profile of an extension that no longer has any use for it.
-    chrome.storage.local.remove(
-        ["useProxy", "rotateEvery", "webshareKey", "webshareList", "webshareListAt"]);
 
 }
 
@@ -60,9 +50,8 @@ button.addEventListener("click", async () => {
             currentWindow: true
         });
 
-        // the roots declared in the manifest; adding a new country means updating both places
-        if (!tab || !INDEED_ROOT.test(tab.url || "")) {
-            status.textContent = "Open a job search page on sg / au / hk / uk / my / de .indeed.com first.";
+        if (!tab || !/^https:\/\/startups\.gallery\//.test(tab.url || "")) {
+            status.textContent = "Open https://startups.gallery/news first.";
             return;
         }
 
@@ -94,7 +83,7 @@ button.addEventListener("click", async () => {
 
 chrome.runtime.onMessage.addListener((message) => {
 
-    if (message && message.type === "indeed-crawler-status") {
+    if (message && message.type === "sg-crawler-status") {
         status.textContent = message.text;
     }
 

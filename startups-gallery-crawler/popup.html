@@ -6,7 +6,7 @@
     <style>
         /* accent color is per-extension, everything else is shared */
         :root{
-            --accent:#0a66c2;
+            --accent:#111827;
             --bg:#ffffff;
             --fg:#1b1b1f;
             --muted:#6b7280;
@@ -16,6 +16,7 @@
 
         @media (prefers-color-scheme: dark){
             :root{
+                --accent:#e8e8ea;
                 --bg:#1f2023;
                 --fg:#e8e8ea;
                 --muted:#9aa0a6;
@@ -65,36 +66,6 @@
 
         .head strong{font-size:12px;font-weight:600}
 
-        .links a{
-            color:var(--accent);
-            font-size:11px;
-            cursor:pointer;
-            text-decoration:none;
-        }
-
-        .links a:hover{text-decoration:underline}
-        .links i{color:var(--muted);font-style:normal;margin:0 3px}
-
-        .options{
-            display:grid;
-            grid-template-columns:repeat(2,1fr);
-            gap:5px 10px;
-            padding:8px;
-            border:1px solid var(--line);
-            border-radius:8px;
-            background:var(--field);
-            max-height:190px;
-            overflow-y:auto;
-        }
-
-        .options label{
-            display:flex;
-            align-items:center;
-            gap:6px;
-            font-size:12px;
-            cursor:pointer;
-        }
-
         input[type=checkbox]{
             width:14px;
             height:14px;
@@ -112,7 +83,7 @@
         }
 
         .num input{
-            width:76px;
+            width:80px;
             padding:4px 6px;
             border:1px solid var(--line);
             border-radius:6px;
@@ -131,7 +102,7 @@
             border:0;
             border-radius:8px;
             background:var(--accent);
-            color:#fff;
+            color:var(--bg);
             font:600 13px/1 inherit;
             cursor:pointer;
         }
@@ -146,39 +117,43 @@
             color:var(--muted);
             word-break:break-word;
         }
+
+        .checkline{display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
     </style>
 </head>
 
 <body>
 
-<h1>Wellfound Company Crawler</h1>
+<h1>Startups Gallery</h1>
 
 <section>
     <div class="head">
-        <strong>Company size</strong>
-        <span class="links"><a id="all">all</a><i>&middot;</i><a id="none">none</a></span>
+        <strong>Load More</strong>
+        <label class="num">max clicks <input type="number" id="maxClicks" min="1" step="1" placeholder="all"></label>
     </div>
-    <div class="options" id="sizes"></div>
-    <p class="hint" id="hint"></p>
+    <p class="hint">The feed ships 50 rounds and loads the rest only when the button is clicked &mdash;
+    <code>?page=2</code> serves the same 50, so there is no URL to walk. Blank = keep clicking until the
+    button is gone.</p>
 </section>
 
 <section>
     <div class="head">
-        <strong>Pages</strong>
-        <label class="num">max <input type="number" id="maxPages" min="1" step="1" placeholder="all"></label>
+        <strong>Company pages</strong>
+        <label class="checkline"><input type="checkbox" id="details" checked> open</label>
     </div>
-    <p class="hint">Blank = every page in the pagination. Each page costs one request.</p>
+    <p class="hint">Location, Employees, Description and the full investor list are on the company page, not
+    on the feed row. Turn it off and those four columns stay blank &mdash; the run is then one request long.</p>
 </section>
 
 <section>
     <div class="head">
         <strong>Speed</strong>
-        <label class="num">parallel <input type="number" id="concurrency" min="1" max="12" step="1" value="6"></label>
+        <label class="num">parallel <input type="number" id="concurrency" min="1" max="12" step="1" value="4"></label>
     </div>
-    <p class="hint">Companies crawled in parallel. Higher = faster, but may hit Wellfound rate limits. Lower to 2–3 if you get 429 errors.</p>
+    <p class="hint">Company pages fetched at the same time. Drop to 2 if the console shows 403 or 429.</p>
 </section>
 
-<button id="crawl">Crawl Search Results</button>
+<button id="crawl">Crawl Funding News</button>
 
 <div id="status"></div>
 

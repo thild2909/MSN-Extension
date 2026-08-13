@@ -133,13 +133,13 @@ button.addEventListener("click", async () => {
             return;
         }
 
-        // xlsx.full.min.js MUST load before content.js: the content script runs in the
+        // core.js MUST load before content.js: the content script runs in the
         // tab's isolated world and cannot see the popup's variables.
         await chrome.scripting.executeScript({
             target: {
                 tabId: tab.id
             },
-            files: ["xlsx.full.min.js", "core.js", "content.js"]
+            files: ["core.js", "content.js"]
         });
 
         status.textContent = "Running. Leave this tab open; progress is in the page console (F12).";

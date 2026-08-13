@@ -30,6 +30,8 @@ const fs=require("fs");
 const path=require("path");
 const vm=require("vm");
 
+const {parseCsv}=require("./csv.js");
+
 const {makeDocument}=require("./minidom.js");
 
 const FIXTURE=require("./foundit-fixture.js");
@@ -156,7 +158,7 @@ function run(options){
         MutationObserver:class{observe(){}disconnect(){}takeRecords(){return [];}},
         Date,Math,JSON,Promise,Set,Map,Array,Object,String,Number,RegExp,Error,isNaN,parseInt,parseFloat,Infinity,
         URL,URLSearchParams,
-        Blob:class{constructor(){}},
+        Blob:class{constructor(parts){state.rows=parseCsv(parts.join(""));}},
 
         DOMParser:class{
             parseFromString(html){
@@ -195,15 +197,6 @@ function run(options){
                 sendMessage:async()=>({ok:false,error:"no worker in this harness"}),
                 onMessage:{addListener(){}}
             }
-        },
-
-        XLSX:{
-            utils:{
-                json_to_sheet:written=>{state.rows=written;return {};},
-                book_new:()=>({}),
-                book_append_sheet:()=>{}
-            },
-            write:()=>new Uint8Array(4)
         }
     };
 

@@ -4,6 +4,11 @@
 const fs=require("fs");
 const vm=require("vm");
 
+const {parseCsv}=require("./csv.js");
+
+// what the last exportCsv wrote, so the export can be checked against the file itself
+let written={text:"",rows:[]};
+
 const sandbox={
     console:{log:()=>{},warn:()=>{},error:()=>{}},
     performance:{now:()=>Date.now()},
@@ -12,12 +17,10 @@ const sandbox={
     Date,Math,JSON,Promise,Set,Map,Array,Object,String,Number,RegExp,Error,isNaN,parseInt,Infinity,
     URL,URLSearchParams,
     DOMParser:class{parseFromString(html){return {html};}},
-    Blob:class{},
+    Blob:class{constructor(parts){written={text:parts.join(""),rows:parseCsv(parts.join(""))};}},
     location:{href:"https://x.test/list?page=1",origin:"https://x.test"},
     chrome:{storage:{local:{get:async()=>({}),set:async()=>{},remove:async()=>{}}}},
-    document:{createElement:()=>({style:{},click(){},remove(){}}),body:{appendChild(){}}},
-    XLSX:{utils:{json_to_sheet:(rows)=>({rows}),book_new:()=>({}),book_append_sheet:()=>{}},
-        write:()=>new Uint8Array(4)}
+    document:{createElement:()=>({style:{},click(){},remove(){}}),body:{appendChild(){}}}
 };
 
 sandbox.window=sandbox;
@@ -97,11 +100,41 @@ const empty=core.companyKeys([],job=>job.id,job=>job.company);
 check("an unnamed company still gets a key",typeof empty({id:"",company:""})==="string"
     &&empty({id:"",company:""}).length>0,empty({id:"",company:""}));
 
-console.log("\ncore.exportXlsx - clips cells past Excel's ceiling instead of writing an unopenable file");
+console.log("\ncore.exportCsv - clips cells past Excel's import ceiling instead of losing the tail silently");
 const long="x".repeat(40000);
-const out=core.exportXlsx([{A:long,B:"short"}],{headers:["A","B"],filename:"t.xlsx"});
+const out=core.exportCsv([{A:long,B:"short"}],{headers:["A","B"],filename:"t.csv"});
 check("reports the clip",out.clipped===1,"clipped="+out.clipped);
-check("cell fits Excel",sandbox.XLSX.utils.json_to_sheet.lastRows===undefined||true);
+check("the cell in the file fits Excel",written.rows[0].A.length<=core.CELL_LIMIT,
+    written.rows[0].A.length+" characters");
+check("the clip is marked, not silent",/\.\.\.\[truncated\]$/.test(written.rows[0].A));
+check("the untouched cell is untouched",written.rows[0].B==="short",written.rows[0].B);
+
+// Every crawler writes a Positions cell holding one line per ad and a Location cell holding
+// "City, Country". Unescaped, either one splits the row and shifts every column after it - which
+// is not a crash, it is a file that opens fine with the wrong data in it.
+console.log("\ncore.exportCsv - a comma, a quote and a newline in a cell do not shift the columns");
+core.exportCsv([{
+    "Company Name":'Smith, Jones & "Co"',
+    Location:"Zürich, Switzerland",
+    Positions:"Data Engineer\nSoftware Engineer"
+}],{headers:["Company Name","Location","Positions"],filename:"t.csv"});
+
+check("the row still has three fields",Object.keys(written.rows[0]).length===3,
+    JSON.stringify(written.rows[0]));
+check("a comma stays inside its cell",written.rows[0]["Company Name"]==='Smith, Jones & "Co"',
+    written.rows[0]["Company Name"]);
+check("a newline stays inside its cell",
+    written.rows[0].Positions==="Data Engineer\nSoftware Engineer",
+    JSON.stringify(written.rows[0].Positions));
+check("Excel is told the file is UTF-8",written.text.charCodeAt(0)===0xFEFF);
+check("a non-ASCII name survives",/Zürich/.test(written.text));
+
+// A row that happens to be missing a field used to hand every later value to the wrong header.
+console.log("\ncore.exportCsv - a missing field leaves an empty cell, it does not shift the row");
+core.exportCsv([{A:"1",C:"3"}],{headers:["A","B","C"],filename:"t.csv"});
+check("the gap is where it should be",
+    written.rows[0].A==="1"&&written.rows[0].B===""&&written.rows[0].C==="3",
+    JSON.stringify(written.rows[0]));
 
 console.log("\ncore.makeFetcher - a dropped connection is retried, not written off");
 {

@@ -180,12 +180,12 @@
     try{
 
         //---------------------------------------------------
-        // 0. XLSX must be injected into the tab BEFORE content.js
+        // 0. core.js must be injected into the tab BEFORE content.js
         //---------------------------------------------------
 
-        if(typeof XLSX==="undefined"){
+        if(!core){
 
-            const msg="XLSX is not loaded in this tab. popup.js must inject xlsx.full.min.js before content.js.";
+            const msg="core.js is not loaded in this tab. popup.js must inject core.js before content.js.";
             console.error(LOG,msg);
             alert(msg);
             return;
@@ -327,10 +327,9 @@
             "Remote/Onsite":company.modes.join(", ")
         }));
 
-        const written=core.exportXlsx(results,{
+        const written=core.exportCsv(results,{
             headers:HEADERS,
-            widths:[34,30,60,16,18,18],
-            filename:"dice_companies.xlsx",
+            filename:"dice_companies.csv",
             log:LOG
         });
 
@@ -400,7 +399,7 @@
         if(!state.crashed) checkpoint.clear();
 
         // let the download start before the alert blocks the page
-        setTimeout(()=>alert(summary+"\nSaved as dice_companies.xlsx"),0);
+        setTimeout(()=>alert(summary+"\nSaved as dice_companies.csv"),0);
 
     }
 

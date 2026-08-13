@@ -61,6 +61,14 @@ class Node{
         return this.childNodes.filter(child=>child.nodeType===1);
     }
 
+    // parentNode's element-only twin. A crawler walking UP the tree - to grow a block around a
+    // link, or to reach the row a cell sits in - uses this one, because parentNode also answers
+    // with text nodes and the document. Without it the walk reads `undefined` on the first hop
+    // and the fixture tests a path the browser never takes.
+    get parentElement(){
+        return this.parentNode&&this.parentNode.nodeType===1?this.parentNode:null;
+    }
+
     // every element below this one, in document order - which is what querySelectorAll promises
     descendants(out){
 
@@ -107,7 +115,7 @@ class Node{
     appendChild(){}
     scrollIntoView(){}
 
-    // exportXlsx builds an <a>, hides it and clicks it
+    // exportCsv builds an <a>, hides it and clicks it
     get style(){
 
         if(!this._style) this._style={};

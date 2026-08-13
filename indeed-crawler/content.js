@@ -5,7 +5,7 @@
 
     // sg / au / hk / uk / my .indeed.com - same markup, only the domain and language differ
     const COUNTRY=(location.hostname.split(".")[0]||"").toLowerCase();
-    const FILE="indeed_"+(/^[a-z]{2}$/.test(COUNTRY)?COUNTRY+"_":"")+"companies.xlsx";
+    const FILE="indeed_"+(/^[a-z]{2}$/.test(COUNTRY)?COUNTRY+"_":"")+"companies.csv";
 
     //---------------------------------------------------
     // guard against double runs when the button is clicked repeatedly
@@ -474,12 +474,12 @@
     try{
 
         //---------------------------------------------------
-        // 0. XLSX must be injected into the tab BEFORE content.js
+        // 0. core.js must be injected into the tab BEFORE content.js
         //---------------------------------------------------
 
-        if(typeof XLSX==="undefined"){
+        if(!core){
 
-            const msg="XLSX is not loaded in this tab. popup.js must inject xlsx.full.min.js before content.js.";
+            const msg="core.js is not loaded in this tab. popup.js must inject core.js before content.js.";
             console.error(LOG,msg);
             alert(msg);
             return;
@@ -742,9 +742,8 @@
             "Remote/Onsite":company.modes.join(", ")
         }));
 
-        const written=core.exportXlsx(results,{
+        const written=core.exportCsv(results,{
             headers:HEADERS,
-            widths:[32,24,60,18,16,16],
             filename:FILE,
             log:LOG
         });

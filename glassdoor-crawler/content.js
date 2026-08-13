@@ -10,7 +10,7 @@
     // "glassdoor.com.au" -> "com_au", used to keep one file per country instead of overwriting
     const COUNTRY=HOST.replace(/^glassdoor\./,"").replace(/\./g,"_")||"com";
 
-    const FILENAME=`glassdoor_companies_${COUNTRY}.xlsx`;
+    const FILENAME=`glassdoor_companies_${COUNTRY}.csv`;
 
     //---------------------------------------------------
     // guard against double runs when the button is clicked repeatedly
@@ -383,12 +383,12 @@
     try{
 
         //---------------------------------------------------
-        // 0. XLSX must be injected into the tab BEFORE content.js
+        // 0. core.js must be injected into the tab BEFORE content.js
         //---------------------------------------------------
 
-        if(typeof XLSX==="undefined"){
+        if(!core){
 
-            const msg="XLSX is not loaded in this tab. popup.js must inject xlsx.full.min.js before content.js.";
+            const msg="core.js is not loaded in this tab. popup.js must inject core.js before content.js.";
             console.error(LOG,msg);
             alert(msg);
             return;
@@ -636,9 +636,8 @@
             "Remote/Onsite":company.modes.join(", ")
         }));
 
-        const written=core.exportXlsx(results,{
+        const written=core.exportCsv(results,{
             headers:HEADERS,
-            widths:[30,26,20,22,60,16,18,16],
             filename:FILENAME,
             log:LOG
         });
