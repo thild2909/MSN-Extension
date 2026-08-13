@@ -42,6 +42,32 @@ per search**, whatever the result count says. `?page=26` upwards answer `200` wi
 it is page 25's list again. The crawler stops at the repeat and says so in the summary rather than
 letting a file with 750 of 11,850 jobs read like a complete run.
 
+`foundit-crawler` is both at once, because foundit's search page comes in two shapes and the query
+string decides which:
+
+| URL | What arrives |
+|---|---|
+| `/search/data-engineer-jobs` | server-rendered — 20 cards in the HTML, and the whole search API response in the RSC payload |
+| `/search/data-engineer-jobs?query=data+engineer` | a shimmer skeleton — zero cards, zero data, the list is fetched by the browser after load |
+
+The second is the URL a person ends up on and copies, and it is empty to a `fetch()`. So the tab is
+read as it stands and every page after it is fetched from the first shape, where page N is the same
+path with `-N` on the end. Page 1..24 of a 465 result search answer `200`; page 25 answers `307`,
+which redirects to page 1 — a page past the end succeeds and comes back full of jobs, so the walk
+has to notice the repeat rather than read the response.
+
+The other thing foundit does not do is put its best two columns in the markup. A server-rendered
+card carries **no company id** (the career link is filled in by the browser) and **no posting date
+at all** — both are in the RSC payload at the bottom of the document, split across ~340
+`self.__next_f.push()` calls with job records straddling the cuts. `content.js` lifts the payload
+out of the raw HTML inside its `slice`, so the whole 2MB page is never parsed, and reads the cards
+as well: a page rescued through a tab comes back as markup with no payload behind it, and those
+jobs still have to reach the file.
+
+Two columns are empty on every foundit run and the summary says so: there is no headcount on a
+card, in the payload, on a job page or in any of the fifteen search facets foundit offers, and no
+work-model field either — no remote/hybrid/on-site value anywhere, and no facet to filter by one.
+
 ## After editing core.js or tabs.js
 
 Copy them back out, or the change only lands in one crawler:
@@ -127,6 +153,23 @@ node _shared/test/wf-403.test.js ./wellfound-company-crawler
 # and checks the detail pane's "Similar Jobs" strip - role="list" aria-label="Job search results",
 # the same two attributes as the real list - stays out of the file.
 node _shared/test/dice-cap.test.js ./dice-crawler
+
+# drives foundit-crawler against REAL foundit markup and a REAL foundit search payload (in
+# foundit-fixture.js), parsed for real. foundit is the one site here whose search page is BOTH
+# server-rendered and browser-rendered depending on the query string, and whose two best columns -
+# the company id and the posting date - are in neither the cards nor the DOM but in an RSC payload
+# split across hundreds of push() calls. So both readers run against both shapes:
+#   * the open tab in its browser-rendered shape, whose cards DO carry a career link and a
+#     "Posted 12 days ago" label, and whose payload is not there yet
+#   * fetched pages in their server-rendered shape, whose cards carry neither
+#   * a page as a TAB hands it back - rendered markup, no scripts - which is the shape the payload
+#     reader cannot help with at all, and which still has to reach the file
+# It also holds the two rules the sheet is built on, and foundit breaks both harder than most:
+# "CSI Interfusion" and "CSI Interfusion Sdn Bhd" fold to the same name and are two employers,
+# while "mr diy international" and "MR D.I.Y. International" do NOT fold and are one.
+# Finally it walks off the end of a search, where foundit answers with a 307 to page 1 rather than
+# a 404 - a request that succeeds and comes back full of jobs, and adds nothing.
+node _shared/test/foundit-pages.test.js ./foundit-crawler
 ```
 
 Run all of them after touching `core.js` or any `content.js`.

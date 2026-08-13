@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "foundit Company Crawler",
+  "version": "1.0",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.foundit.my/*",
+    "https://www.foundit.in/*",
+    "https://www.foundit.sg/*",
+    "https://www.foundit.com.ph/*",
+    "https://www.foundit.id/*",
+    "https://www.foundit.com.hk/*",
+    "https://www.founditgulf.com/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "foundit Company Crawler",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}
