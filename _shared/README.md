@@ -123,6 +123,43 @@ Two columns are empty on every foundit run and the summary says so: there is no 
 card, in the payload, on a job page or in any of the fifteen search facets foundit offers, and no
 work-model field either — no remote/hybrid/on-site value anywhere, and no facet to filter by one.
 
+`apollo-crawler` is the only one here that reads nothing off the page it is pointed at. Apollo's
+People finder is a masked table — `****@****.com`, no revenue, no funding, no technologies, no
+company address — and every column the sheet asks for is in the JSON the app already fetches from
+its own `mixed_people/search` endpoint, not in the DOM. So the crawler does not scrape the table:
+it **captures the app's own search request and replays it**, page by page, changing only `page`.
+
+That takes a shape none of the others have. `inject.js` is a `world:"MAIN"`, `document_start`
+content script — it runs in the page's own JS world, which is the only place the app's `fetch`/XHR
+can be patched and the request seen with the exact auth (cookies, CSRF, whatever headers the app
+adds) it was sent under. It records the last response that carries **both** a `pagination` block and
+a `people`/`contacts` array — matching on shape, not on a path, so an endpoint rename empties nothing
+— and answers two questions over `window.postMessage`: *do you have a template yet*, and *replay
+page N*. `content.js` runs in the isolated world (it needs `chrome.storage` for the checkpoint and
+`core.exportCsv` for the file), drives the walk, and maps each record to the 46 columns. It keeps
+**every** record — no dedupe, nothing skipped: the goal here is the complete set, so a person Apollo
+serves on two pages is written twice. The walk is bounded instead by the page count, never by the
+URL, so it still terminates on a search whose tail repeats.
+
+Speed is three things. It requests **100 records a page** instead of Apollo's 25 (a quarter of the
+round-trips), and reads the *real* page size back from page 1 — so if Apollo ignores the override
+and serves 25, the page count is recomputed from what actually came back and no record is lost. It
+fetches pages **`concurrency` at a time** through `core.pipelinePages`, which keeps a window in
+flight but hands them to the mapper in page order, so the file is still deterministic. And it pays
+**no fixed delay** — full speed until a `429`/`403`, then a single shared backoff every worker
+respects. Page 1 is fetched alone first, only to learn the page count before the pool opens.
+
+Two rules are load-bearing and both are about **not spending the user's credits**: a locked email
+comes back as `email_not_unlocked@domain.com` and a locked phone as `null` or a `*`-masked string,
+and both are written **blank** rather than filled with a placeholder that reads like real data. The
+crawler never calls a reveal endpoint. The company phone, on the other hand, is public and is kept.
+
+Because the request is replayed from the page's own world, there is no `fetch()` from the extension,
+no cross-origin call, and so no tab fallback and no worker — `apollo-crawler` is the one crawler here
+with no `background.js` and no `tabs.js`. The one failure mode with a human fix is a tab that was
+open before the extension was installed or updated: the `document_start` interceptor never ran in
+it, the probe comes back empty, and the popup says to reload the tab.
+
 ## After editing core.js or tabs.js
 
 Copy them back out, or the change only lands in one crawler:
@@ -240,6 +277,18 @@ node _shared/test/foundit-pages.test.js ./foundit-crawler
 # It also holds the rule the sheet is built on: one row per ROUND, one request per COMPANY, and an
 # older round keeps its own stage rather than the stage the company has since raised.
 node _shared/test/sg-loadmore.test.js ./startups-gallery-crawler
+
+# drives apollo-crawler/content.js through a REAL mixed_people/search response, mapped for real, and
+# inspects the CSV it writes. Where smoke.js only proves the crawler survives a blank stub, this
+# stubs the page-world interceptor so the whole replay -> map -> export path runs, and holds the
+# two rules the sheet is built on:
+#   * a locked email ("email_not_unlocked@domain.com") and a locked phone come out BLANK - the run
+#     never spends a credit, so a placeholder that reads like a real address is never written
+#   * nothing is skipped - the run keeps every record, so a person served on page 1 and again on
+#     page 2 is written twice rather than deduped away
+# It also checks all 46 columns come out in order, revenue/funding map to their clean+printed pair,
+# and multi-value cells (keywords, technologies, departments) are quoted.
+node _shared/test/apollo-map.test.js ./apollo-crawler
 ```
 
 Run all of them after touching `core.js` or any `content.js`.

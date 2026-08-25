@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Apollo Crawler",
+  "version": "1.0",
+  "description": "Exports the current Apollo people search to CSV by replaying the app's own search request. Never spends credits.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://app.apollo.io/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.apollo.io/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Apollo Crawler",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}
