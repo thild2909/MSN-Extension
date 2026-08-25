@@ -270,11 +270,13 @@
             json=null;
         }
 
+        // on a rejected request keep the server's error body even when it parsed as JSON, so the
+        // content script can log WHY a page was refused (a 422 names the offending field)
         return {
             ok:res.ok,
             status:res.status,
             json:json,
-            text:json?"":text.slice(0,300)
+            text:res.ok?"":(text?text.slice(0,500):"")
         };
 
     }

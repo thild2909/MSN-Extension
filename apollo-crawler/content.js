@@ -331,10 +331,14 @@
         const settings=await chrome.storage.local.get(["maxPages","perPage","concurrency"]);
 
         const maxPages=Math.max(0,parseInt(settings.maxPages,10)||0);            // 0 = all
-        // 100 records/request instead of Apollo's 25 is 4x fewer round-trips; if Apollo ignores it
-        // the effective size is read back from page 1 below, so the walk never loses a record
+        // Fewer round-trips by asking for more records/request - BUT Apollo's mixed_people/search
+        // validates per_page and rejects an over-large value with 422 (it does NOT silently clamp).
+        // So the default is a value Apollo accepts (25), and if even that is refused with 422 the
+        // walk drops the per_page override entirely and replays the captured request verbatim.
         let perPage=Math.min(100,Math.max(0,parseInt(settings.perPage,10)||0));
-        if(!perPage) perPage=100;
+        if(!perPage) perPage=25;
+        // set to 0 mid-walk if Apollo 422s the override; 0 means "keep the captured per_page"
+        let effPerPage=perPage;
         // how many page requests are in flight at once - the real speed lever
         const concurrency=Math.min(8,Math.max(1,parseInt(settings.concurrency,10)||5));
 
@@ -439,11 +443,24 @@
 
                 if(wait>0) await core.sleep(wait);
 
-                const res=await sendToPage("replay",{page:pg,perPage:perPage},30000);
+                const res=await sendToPage("replay",{page:pg,perPage:effPerPage},30000);
 
                 if(res&&res.ok&&res.json) return res.json;
 
                 const status=res?res.status:0;
+
+                // 422 = Apollo rejected the body. The only field we change is per_page, so an
+                // over-large per_page is the cause: drop the override (replay the captured request
+                // verbatim) and retry this page. Only give up if it 422s even without the override.
+                if(status===422){
+                    console.warn(LOG,`page ${pg} refused (422): ${res.text||"no body"}`);
+                    if(effPerPage){
+                        console.warn(LOG,`dropping per_page override (was ${effPerPage}) and retrying with the captured page size`);
+                        effPerPage=0;
+                        continue;
+                    }
+                    return null;
+                }
 
                 // rate limit / transient / dropped reply -> back off everyone, then retry this page
                 if(status===429||status===403||status===500||status===502||status===503||!res){
@@ -455,6 +472,7 @@
                 }
 
                 // a hard 4xx that will not fix itself
+                if(res&&res.text) console.warn(LOG,`page ${pg} refused (${status}): ${res.text}`);
                 return null;
 
             }
